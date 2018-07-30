@@ -75,8 +75,20 @@ func (e expr) consumeBasicArg(pos int, exp Arg) (int, error) {
 		}
 		// special case! consume all subsequent args (if any) in args that will also yield a seriesList
 		for len(e.args) > pos+1 && (e.args[pos+1].etype == etName || e.args[pos+1].etype == etFunc) {
-			pos += 1
+			pos++
 		}
+	case ArgIn:
+		for _, a := range v.args {
+			p, err := e.consumeBasicArg(pos, a)
+			if err == nil {
+				return p, err
+			}
+		}
+		expStr := []string{}
+		for _, a := range v.args {
+			expStr = append(expStr, fmt.Sprintf("%T", a))
+		}
+		return 0, ErrBadArgumentStr{strings.Join(expStr, ","), got.etype.String()}
 	case ArgInt:
 		if got.etype != etInt {
 			return 0, ErrBadArgumentStr{"int", got.etype.String()}
@@ -197,6 +209,25 @@ func (e expr) consumeSeriesArg(pos int, exp Arg, context Context, stable bool, r
 	var err error
 	var fn GraphiteFunc
 	switch v := exp.(type) {
+	case ArgIn:
+		if e.args[pos].etype == etName || e.args[pos].etype == etFunc {
+			for _, a := range v.args {
+				switch v := a.(type) {
+				case ArgSeries, ArgSeriesList, ArgSeriesLists:
+					p, reqs, err := e.consumeSeriesArg(pos, v, context, stable, reqs)
+					if err != nil {
+						return 0, nil, err
+					}
+					return p, reqs, err
+				}
+			}
+			expStr := []string{}
+			for _, a := range v.args {
+				expStr = append(expStr, fmt.Sprintf("%T", a))
+			}
+			return 0, nil, ErrBadArgumentStr{strings.Join(expStr, ","), got.etype.String()}
+		}
+
 	case ArgSeries:
 		if got.etype != etName && got.etype != etFunc {
 			return 0, nil, ErrBadArgumentStr{"func or name", got.etype.String()}
@@ -226,7 +257,7 @@ func (e expr) consumeSeriesArg(pos int, exp Arg, context Context, stable bool, r
 		*v.val = append(*v.val, fn)
 		// special case! consume all subsequent args (if any) in args that will also yield a seriesList
 		for len(e.args) > pos+1 && (e.args[pos+1].etype == etName || e.args[pos+1].etype == etFunc) {
-			pos += 1
+			pos++
 			fn, reqs, err = newplan(e.args[pos], context, stable, reqs)
 			if err != nil {
 				return 0, nil, err
@@ -236,7 +267,7 @@ func (e expr) consumeSeriesArg(pos int, exp Arg, context Context, stable bool, r
 	default:
 		return 0, nil, fmt.Errorf("unsupported type %T for consumeSeriesArg", exp)
 	}
-	pos += 1
+	pos++
 	return pos, reqs, nil
 }
 
@@ -257,6 +288,21 @@ func (e expr) consumeKwarg(key string, optArgs []Arg) error {
 	}
 	got := e.namedArgs[key]
 	switch v := exp.(type) {
+	case ArgIn:
+		for _, a := range v.args {
+			// interesting little trick here.. when using ArgIn you only have to set the key on ArgIn,
+			// not for every individual sub-arg so to make sure we pass the key matching requirement,
+			// we just call consumeKwarg with whatever the key is set to (typically "")
+			err := e.consumeKwarg(a.Key(), []Arg{a})
+			if err == nil {
+				return err
+			}
+		}
+		expStr := []string{}
+		for _, a := range v.args {
+			expStr = append(expStr, fmt.Sprintf("%T", a))
+		}
+		return ErrBadArgumentStr{strings.Join(expStr, ","), got.etype.String()}
 	case ArgInt:
 		if got.etype != etInt {
 			return ErrBadKwarg{key, exp, got.etype}
