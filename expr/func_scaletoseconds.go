@@ -55,12 +55,25 @@ func (s *FuncScaleToSeconds) Exec(cache map[Req][]models.Series) ([]models.Serie
 		for _, p := range serie.Datapoints {
 			if !math.IsNaN(p.Val) {
 				// round to 6 decimal places to mimic graphite
-				roundingFactor := math.Pow(10, 6)
-				p.Val = math.Round(p.Val*factor*roundingFactor) / roundingFactor
+				p.Val = round(p.Val*factor, 6)
 			}
 			transformed.Datapoints = append(transformed.Datapoints, p)
 		}
 	}
 	cache[Req{}] = append(cache[Req{}], out...)
 	return out, nil
+}
+
+func round(val float64, places int) (newVal float64) {
+	var round float64
+	pow := math.Pow(10, float64(places))
+	digit := pow * val
+	_, div := math.Modf(digit)
+	if div >= 0.5 {
+		round = math.Ceil(digit)
+	} else {
+		round = math.Floor(digit)
+	}
+	newVal = round / pow
+	return
 }
