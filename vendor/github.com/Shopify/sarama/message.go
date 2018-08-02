@@ -148,7 +148,7 @@ func (m *Message) decode(pd packetDecoder) (err error) {
 
 	switch m.Codec {
 	case CompressionNone:
-		// nothing to do
+		// Copy buffers for reuse
 	case CompressionGZIP:
 		if m.Value == nil {
 			break
@@ -167,9 +167,11 @@ func (m *Message) decode(pd packetDecoder) (err error) {
 		if m.Value == nil {
 			break
 		}
-		if m.Value, err = snappy.Decode(m.Value); err != nil {
+
+		if m.Value, err = snappy.DecodeInto(nil, m.Value); err != nil {
 			return err
 		}
+
 		if err := m.decodeSet(); err != nil {
 			return err
 		}
