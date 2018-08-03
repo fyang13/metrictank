@@ -84,6 +84,29 @@ type consumer struct {
 	brokerConsumers map[*Broker]*brokerConsumer
 }
 
+var messageChannel = make(chan *ConsumerMessage, 250000)
+
+func ReturnMessage(msg *ConsumerMessage) {
+	select {
+	case messageChannel <- msg:
+	default:
+		// buffer full, oh well
+	}
+}
+
+func GetMessage(msg ConsumerMessage) *ConsumerMessage {
+	var msgPtr *ConsumerMessage
+	select {
+	case msgPtr = <-messageChannel:
+	default:
+		// no buffer
+		msgPtr = new(ConsumerMessage)
+	}
+	*msgPtr = msg
+
+	return msgPtr
+}
+
 // NewConsumer creates a new consumer using the given broker addresses and configuration.
 func NewConsumer(addrs []string, config *Config) (Consumer, error) {
 	client, err := NewClient(addrs, config)
@@ -498,7 +521,7 @@ func (child *partitionConsumer) parseMessages(msgSet *MessageSet) ([]*ConsumerMe
 			prelude = false
 
 			if offset >= child.offset {
-				messages = append(messages, &ConsumerMessage{
+				messages = append(messages, GetMessage(ConsumerMessage{
 					Topic:          child.topic,
 					Partition:      child.partition,
 					Key:            msg.Msg.Key,
@@ -506,7 +529,7 @@ func (child *partitionConsumer) parseMessages(msgSet *MessageSet) ([]*ConsumerMe
 					Offset:         offset,
 					Timestamp:      msg.Msg.Timestamp,
 					BlockTimestamp: msgBlock.Msg.Timestamp,
-				})
+				}))
 				child.offset = offset + 1
 			} else {
 				incomplete = true
@@ -534,7 +557,7 @@ func (child *partitionConsumer) parseRecords(batch *RecordBatch) ([]*ConsumerMes
 		prelude = false
 
 		if offset >= child.offset {
-			messages = append(messages, &ConsumerMessage{
+			messages = append(messages, GetMessage(ConsumerMessage{
 				Topic:     child.topic,
 				Partition: child.partition,
 				Key:       rec.Key,
@@ -542,7 +565,7 @@ func (child *partitionConsumer) parseRecords(batch *RecordBatch) ([]*ConsumerMes
 				Offset:    offset,
 				Timestamp: batch.FirstTimestamp.Add(rec.TimestampDelta),
 				Headers:   rec.Headers,
-			})
+			}))
 			child.offset = offset + 1
 		} else {
 			incomplete = true

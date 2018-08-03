@@ -323,6 +323,7 @@ func (k *KafkaMdm) consumePartition(topic string, partition int32, currentOffset
 			}
 			k.handleMsg(msg.Value, partition)
 			currentOffset = msg.Offset
+			sarama.ReturnMessage(msg)
 		case ts := <-ticker.C:
 			if err := offsetMgr.Commit(topic, partition, currentOffset); err != nil {
 				log.Error(3, "kafka-mdm failed to commit offset for %s:%d, %s", topic, partition, err)
