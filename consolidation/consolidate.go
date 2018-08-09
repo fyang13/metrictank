@@ -27,25 +27,26 @@ func Consolidate(in []schema.Point, aggNum uint32, consolidator Consolidator) []
 	// (e.g. no remainder). This case is the easiest to handle
 	outLen := len(in) / num
 	cleanLen := num * outLen
+
 	if len(in) == cleanLen {
 		out := in[0:outLen]
 		var outI, nextI int
 		for inI := 0; inI < cleanLen; inI = nextI {
 			nextI = inI + num
 			out[outI] = schema.Point{Val: aggFunc(in[inI:nextI]), Ts: in[nextI-1].Ts}
-			outI += 1
+			outI++
 		}
 		return out
 	}
 
 	// the fit is not perfect: first process all the aggNum sized groups:
-	outLen += 1
+	outLen++
 	out := in[0:outLen]
 	var outI, nextI int
 	for inI := 0; inI < cleanLen; inI = nextI {
 		nextI = inI + num
 		out[outI] = schema.Point{Val: aggFunc(in[inI:nextI]), Ts: in[nextI-1].Ts}
-		outI += 1
+		outI++
 	}
 
 	// we have some leftover points that didn't get aggregated yet because they're fewer than aggNum.
@@ -61,6 +62,7 @@ func Consolidate(in []schema.Point, aggNum uint32, consolidator Consolidator) []
 		lastTs = in[cleanLen].Ts + (aggNum-1)*interval
 	}
 	out[outI] = schema.Point{Val: aggFunc(in[cleanLen:]), Ts: lastTs}
+
 	return out
 }
 
