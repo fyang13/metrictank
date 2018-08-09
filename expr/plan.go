@@ -154,7 +154,7 @@ func newplanFunc(e *expr, fn GraphiteFunc, context Context, stable bool, reqs []
 		}
 	}
 	if !argExp.Optional() {
-		cutoff += 1
+		cutoff++
 	}
 
 	// we stopped iterating the mandatory args.
@@ -179,12 +179,12 @@ func newplanFunc(e *expr, fn GraphiteFunc, context Context, stable bool, reqs []
 
 	// for any provided keyword args, verify that they are what the function stipulated
 	// and that they have not already been specified via their position
-	for key := range e.namedArgs {
+	for key, got := range e.namedArgs {
 		_, ok := seenKwargs[key]
 		if ok {
 			return nil, ErrKwargSpecifiedTwice{key}
 		}
-		err = e.consumeKwarg(key, argsExp[cutoff:])
+		err = e.consumeKwarg(key, argsExp[cutoff:], got)
 		if err != nil {
 			return nil, err
 		}
@@ -198,15 +198,18 @@ func newplanFunc(e *expr, fn GraphiteFunc, context Context, stable bool, reqs []
 	// this function, we can set up the input arguments for the function
 	// that are series
 	pos = 0
-	for _, argExp = range argsExp[:cutoff] {
+	for _, argExp = range argsExp {
+		if pos >= len(e.args) {
+			break // no more args specified. we're done.
+		}
 		switch argExp.(type) {
-		case ArgSeries, ArgSeriesList, ArgSeriesLists:
+		case ArgSeries, ArgSeriesList, ArgSeriesLists, ArgIn:
 			pos, reqs, err = e.consumeSeriesArg(pos, argExp, context, stable, reqs)
 			if err != nil {
 				return nil, err
 			}
 		default:
-			return reqs, err
+			pos++
 		}
 	}
 	return reqs, err
