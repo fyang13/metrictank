@@ -172,6 +172,7 @@ buffer-size = 20000
 ```
 [chunk-cache]
 # maximum size of chunk cache in bytes. (1024 ^ 3) * 4 = 4294967296 = 4G
+# 0 disables cache
 max-size = 4294967296
 ```
 
@@ -205,6 +206,8 @@ time-zone = local
 get-targets-concurrency = 20
 # default limit for tagdb query results, can be overridden with query parameter "limit"
 tagdb-default-limit = 100
+# ratio of peer responses after which speculation is used. Set to 1 to disable.
+speculation-threshold = 1
 ```
 
 ## metric data inputs ##
@@ -347,8 +350,6 @@ brokers = kafka:9092
 topic = metricpersist
 # kafka partitions to consume. use '*' or a comma separated list of id's. Should match kafka-mdm-in's partitions.
 partitions = *
-# method used for partitioning metrics. This should match the settings of tsdb-gw. (byOrg|bySeries)
-partition-scheme = bySeries
 # offset to start consuming from. Can be one of newest, oldest,last or a time duration
 # When using a duration but the offset request fails (e.g. Kafka doesn't have data so far back), metrictank falls back to `oldest`.
 # Should match your kafka-mdm-in setting

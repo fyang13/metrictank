@@ -2,7 +2,9 @@ package cluster
 
 import (
 	"errors"
+	"math/rand"
 	"net/http"
+	"sort"
 	"sync/atomic"
 	"time"
 
@@ -69,7 +71,7 @@ type partitionCandidates struct {
 	nodes    []Node
 }
 
-// return the list of nodes to broadcast requests to
+// MembersForQuery returns the list of nodes to broadcast requests to
 // If partitions are assinged to nodes in groups
 // (a[0,1], b[0,1], c[2,3], d[2,3] as opposed to a[0,1], b[0,2], c[1,3], d[2,3]),
 // only 1 member per partition is returned.
@@ -131,7 +133,10 @@ func MembersForQuery() ([]Node, error) {
 	count := int(atomic.AddUint32(&counter, 1))
 
 LOOP:
+	// for every partition...
 	for _, candidates := range membersMap {
+
+		// prefer the local node if it serves this partition
 		if candidates.nodes[0].GetName() == thisNode.GetName() {
 			if _, ok := selectedMembers[thisNode.GetName()]; !ok {
 				selectedMembers[thisNode.GetName()] = struct{}{}
@@ -140,18 +145,69 @@ LOOP:
 			continue LOOP
 		}
 
+		// for remote nodes, try to pick one we've already included
+
 		for _, n := range candidates.nodes {
 			if _, ok := selectedMembers[n.GetName()]; ok {
 				continue LOOP
 			}
 		}
+
 		// if no nodes have been selected yet then grab a node from
 		// the set of available nodes in such a way that nodes are
 		// weighted fairly across MembersForQuery calls
+
 		selected := candidates.nodes[count%len(candidates.nodes)]
 		selectedMembers[selected.GetName()] = struct{}{}
 		answer = append(answer, selected)
 	}
 
 	return answer, nil
+}
+
+// MembersForSpeculativeQuery returns a prioritized list of nodes for each shard group
+// keyed by the first (lowest) partition of their shard group
+func MembersForSpeculativeQuery() (map[int32][]Node, error) {
+	thisNode := Manager.ThisNode()
+	allNodes := Manager.MemberList()
+	membersMap := make(map[int32][]Node)
+
+	// If we are running in single mode, just return thisNode
+	if Mode == ModeSingle {
+		membersMap[0] = []Node{thisNode}
+		return membersMap, nil
+	}
+
+	peerPartitions := 0
+
+	// store the available nodes for each partition group
+	for _, member := range allNodes {
+		if !member.IsReady() {
+			continue
+		}
+		memberStartPartition := member.GetPartitions()[0]
+
+		if _, ok := membersMap[memberStartPartition]; !ok {
+			peerPartitions += len(member.GetPartitions())
+		}
+
+		membersMap[memberStartPartition] = append(membersMap[memberStartPartition], member)
+	}
+
+	if peerPartitions < minAvailableShards {
+		return nil, InsufficientShardsAvailable
+	}
+
+	for _, shard := range membersMap {
+		// Shuffle to avoid always choosing the same peer first
+		for i := len(shard) - 1; i > 0; i-- {
+			j := rand.Intn(i + 1)
+			shard[i], shard[j] = shard[j], shard[i]
+		}
+		sort.Slice(shard, func(i, j int) bool {
+			return shard[i].GetPriority() < shard[j].GetPriority()
+		})
+	}
+
+	return membersMap, nil
 }
