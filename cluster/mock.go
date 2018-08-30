@@ -1,9 +1,12 @@
 package cluster
 
 import (
+	"bytes"
 	"context"
 	"sort"
 	"time"
+
+	"github.com/tinylib/msgp/msgp"
 )
 
 type MockNode struct {
@@ -33,6 +36,11 @@ func (n *MockNode) GetPriority() int {
 
 func (n MockNode) Post(ctx context.Context, name, path string, body Traceable) ([]byte, error) {
 	return n.postResponse, nil
+}
+
+func (n MockNode) PostInto(result msgp.Decodable, ctx context.Context, name, path string, body Traceable) error {
+	buffer := bytes.NewBuffer(n.postResponse)
+	return result.DecodeMsg(msgp.NewReader(buffer))
 }
 
 func (n *MockNode) GetName() string {

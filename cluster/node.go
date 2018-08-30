@@ -15,6 +15,7 @@ import (
 	opentracing "github.com/opentracing/opentracing-go"
 	tags "github.com/opentracing/opentracing-go/ext"
 	"github.com/raintank/worldping-api/pkg/log"
+	"github.com/tinylib/msgp/msgp"
 )
 
 //go:generate stringer -type=NodeState
@@ -127,13 +128,14 @@ func (n HTTPNode) IsLocal() bool {
 	return n.local
 }
 
-func (n HTTPNode) Post(ctx context.Context, name, path string, body Traceable) (ret []byte, err error) {
+func (n HTTPNode) post(ctx context.Context, name, path string, body Traceable) (*http.Response, error) {
 	ctx, span := tracing.NewSpan(ctx, Tracer, name)
 	tags.SpanKindRPCClient.Set(span)
 	tags.PeerService.Set(span, "metrictank")
 	tags.PeerAddress.Set(span, n.RemoteAddr)
 	tags.PeerHostname.Set(span, n.Name)
 	body.Trace(span)
+	var err error
 	defer func(pre time.Time) {
 		if err != nil {
 			tags.Error.Set(span, true)
@@ -144,7 +146,8 @@ func (n HTTPNode) Post(ctx context.Context, name, path string, body Traceable) (
 		span.Finish()
 	}(time.Now())
 
-	b, err := json.Marshal(body)
+	var b []byte
+	b, err = json.Marshal(body)
 	if err != nil {
 		return nil, NewError(http.StatusInternalServerError, err)
 	}
@@ -183,17 +186,41 @@ func (n HTTPNode) Post(ctx context.Context, name, path string, body Traceable) (
 		transport.CancelRequest(req)
 		<-c // Wait for client.Do but ignore result
 	case resp := <-c:
-		err := resp.err
-		rsp := resp.r
-		if err != nil {
+		if resp.err != nil {
 			tags.Error.Set(span, true)
-			log.Error(3, "CLU HTTPNode: error trying to talk to peer %s: %s", n.Name, err.Error())
+			log.Error(3, "CLU HTTPNode: error trying to talk to peer %s: %s", n.Name, resp.err.Error())
 			return nil, NewError(http.StatusServiceUnavailable, errors.New("error trying to talk to peer"))
 		}
-		return handleResp(rsp)
+		rsp := resp.r
+		if rsp.StatusCode != 200 {
+			// Read in body so that the connection can be reused
+			io.Copy(ioutil.Discard, rsp.Body)
+			return nil, NewError(rsp.StatusCode, fmt.Errorf(rsp.Status))
+		}
+		return rsp, resp.err
+	}
+	return nil, nil
+}
+
+func (n HTTPNode) Post(ctx context.Context, name, path string, body Traceable) ([]byte, error) {
+	rsp, err := n.post(ctx, name, path, body)
+
+	if err != nil || rsp == nil {
+		return nil, err
 	}
 
-	return nil, nil
+	defer rsp.Body.Close()
+	return ioutil.ReadAll(rsp.Body)
+}
+
+func (n HTTPNode) PostInto(result msgp.Decodable, ctx context.Context, name, path string, body Traceable) error {
+	rsp, err := n.post(ctx, name, path, body)
+
+	if err != nil || rsp == nil {
+		return err
+	}
+
+	return msgp.Decode(rsp.Body, result)
 }
 
 func (n HTTPNode) GetName() string {
