@@ -891,17 +891,22 @@ func (s *Server) graphiteTagFindSeries(ctx *middleware.Context, request models.G
 
 func (s *Server) clusterFindByTag(ctx context.Context, orgId uint32, expressions []string, from int64, maxSeries int) ([]Series, error) {
 	data := models.IndexFindByTag{OrgId: orgId, Expr: expressions, From: from}
-	responseChan, errorChan := s.peerQuerySpeculativeChan(ctx, data, "clusterFindByTag", "/index/find_by_tag")
+	responseChan, errorChan := s.peerQuerySpeculativeChan(ctx,
+		func(reqCtx context.Context, peer cluster.Node) (interface{}, error) {
+			resp := models.IndexFindByTagResp{}
+			var err error
+			if peer.IsLocal() {
+				resp.Metrics, err = s.MetricIndex.FindByTag(data.OrgId, data.Expr, data.From)
+			} else {
+				err = peer.PostInto(&resp, reqCtx, "clusterFindByTag", "/index/find_by_tag", data)
+			}
+			return resp, err
+		})
 
 	var allSeries []Series
 
 	for r := range responseChan {
-		resp := models.IndexFindByTagResp{}
-		_, err := resp.UnmarshalMsg(r.buf)
-		if err != nil {
-			return nil, err
-		}
-
+		resp := r.resp.(models.IndexFindByTagResp)
 		// 0 disables the check, so only check if maxSeriesPerReq > 0
 		if maxSeriesPerReq > 0 && len(resp.Metrics)+len(allSeries) > maxSeries {
 			return nil,
