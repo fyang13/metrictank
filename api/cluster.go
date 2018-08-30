@@ -236,6 +236,11 @@ type PeerResponse struct {
 	buf  []byte
 }
 
+type GenericPeerResponse struct {
+	peer cluster.Node
+	resp interface{}
+}
+
 // peerQuery takes a request and the path to request it on, then fans it out
 // across the cluster, except to the local peer. If any peer fails requests to
 // other peers are aborted.
@@ -314,27 +319,20 @@ func (s *Server) peerQuery(ctx context.Context, data cluster.Traceable, name, pa
 func (s *Server) peerQuerySpeculative(ctx context.Context, data cluster.Traceable, name, path string) (map[string]PeerResponse, error) {
 	result := make(map[string]PeerResponse)
 
-	responseChan, errorChan := s.peerQuerySpeculativeChan(ctx, data, name, path)
+	responseChan, errorChan := s.peerQuerySpeculativeChan(ctx, func(reqCtx context.Context, peer cluster.Node) (interface{}, error) {
+		return peer.Post(reqCtx, name, path, data)
+	})
 
 	for resp := range responseChan {
-		result[resp.peer.GetName()] = resp
+		result[resp.peer.GetName()] = PeerResponse{resp.peer, resp.resp.([]byte)}
 	}
 
 	err := <-errorChan
 	return result, err
 }
 
-// peerQuerySpeculativeChan takes a request and the path to request it on, then fans it out
-// across the cluster. If any peer fails requests to other peers are aborted. If enough
-// peers have been heard from (based on speculation-threshold configuration), and we
-// are missing the others, try to speculatively query other members of the shard group.
-// ctx:          request context
-// data:         request to be submitted
-// name:         name to be used in logging & tracing
-// path:         path to request on
-// resultChan:   channel to put responses on as they come in
-func (s *Server) peerQuerySpeculativeChan(ctx context.Context, data cluster.Traceable, name, path string) (<-chan PeerResponse, <-chan error) {
-	resultChan := make(chan PeerResponse)
+func (s *Server) peerQuerySpeculativeChan(ctx context.Context, fetchFunc func(context.Context, cluster.Node) (interface{}, error)) (<-chan GenericPeerResponse, <-chan error) {
+	resultChan := make(chan GenericPeerResponse)
 	errorChan := make(chan error, 1)
 
 	go func() {
@@ -347,7 +345,6 @@ func (s *Server) peerQuerySpeculativeChan(ctx context.Context, data cluster.Trac
 			errorChan <- err
 			return
 		}
-		log.Debug("HTTP %s across %d instances", name, len(peerGroups)-1)
 
 		reqCtx, cancel := context.WithCancel(ctx)
 		defer cancel()
@@ -357,30 +354,19 @@ func (s *Server) peerQuerySpeculativeChan(ctx context.Context, data cluster.Trac
 
 		responses := make(chan struct {
 			shardGroup int32
-			data       PeerResponse
+			data       GenericPeerResponse
 			err        error
 		}, 1)
 
 		askPeer := func(shardGroup int32, peer cluster.Node) {
-			log.Debug("HTTP Render querying %s%s", peer.GetName(), path)
-			buf, err := peer.Post(reqCtx, name, path, data)
+			log.Debug("Querying %s", peer.GetName())
+			resp, err := fetchFunc(reqCtx, peer)
 
-			select {
-			case <-ctx.Done():
-				return
-			default:
-				// Not canceled, continue
-			}
-
-			if err != nil {
-				cancel()
-				log.Error(4, "HTTP Render error querying %s%s: %q", peer.GetName(), path, err)
-			}
 			responses <- struct {
 				shardGroup int32
-				data       PeerResponse
+				data       GenericPeerResponse
 				err        error
-			}{shardGroup, PeerResponse{peer, buf}, err}
+			}{shardGroup, GenericPeerResponse{peer, resp}, err}
 		}
 
 		for group, peers := range peerGroups {
