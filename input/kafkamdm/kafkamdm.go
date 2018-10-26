@@ -310,19 +310,17 @@ func (k *KafkaMdm) consumePartition(topic string, partition int32, currentOffset
 			k.handleMsg(msg.Value, partition)
 			currentOffset = msg.Offset
 		case ts := <-ticker.C:
-			k.lagMonitor.StoreOffset(partition, currentOffset, ts)
 			newest, err := k.tryGetOffset(topic, partition, sarama.OffsetNewest, 1, 0)
 			if err != nil {
 				log.Errorf("kafkamdm: %s", err.Error())
 			} else {
 				partitionLogSizeMetric.Set(int(newest))
 			}
-
 			partitionOffsetMetric.Set(int(currentOffset))
 			if err == nil {
 				lag := int(newest - currentOffset)
 				partitionLagMetric.Set(lag)
-				k.lagMonitor.StoreLag(partition, lag)
+				k.lagMonitor.StoreOffsets(partition, currentOffset, newest, ts)
 			}
 		case <-k.stopConsuming:
 			pc.Close()
