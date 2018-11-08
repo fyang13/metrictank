@@ -1294,6 +1294,7 @@ func (m *MemoryIdx) Prune(now time.Time) ([]idx.Archive, error) {
 	cutoffs := IndexRules.Cutoffs(now)
 
 	m.RLock()
+	preSize := len(m.defById)
 
 DEFS:
 	for _, def := range m.defById {
@@ -1387,14 +1388,16 @@ ORGS:
 			m.Unlock()
 			tl.Add(time.Since(lockStart))
 			pruned = append(pruned, defs...)
-
 		}
 	}
 
-	statMetricsActive.Add(-1 * len(pruned))
+	m.RLock()
+	postSize := len(m.defById)
+	statMetricsActive.Set(len(m.defById))
+	m.RUnlock()
 
 	duration := time.Since(pre)
-	log.Infof("memory-idx: finished pruning of %d series in %s", len(pruned), duration)
+	log.Infof("memory-idx: finished pruning of %d series in %s (true reduction of %d)", len(pruned), duration, preSize-postSize)
 
 	statPruneDuration.Value(duration)
 	return pruned, nil
