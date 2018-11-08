@@ -416,14 +416,14 @@ func (c *CasIdx) load(defs []schema.MetricDefinition, iter cqlIterator, now time
 	cutoffs := memory.IndexRules.Cutoffs(now)
 
 NAMES:
-	for name, defsByName := range defsByNames {
-		irId, _ := memory.IndexRules.Match(name)
+	for nameWithTags, defsByName := range defsByNames {
+		irId, _ := memory.IndexRules.Match(nameWithTags)
 		cutoff := cutoffs[irId]
 		for _, def := range defsByName {
 			if def.LastUpdate >= cutoff {
-				// if one of the defs in a name is not stale, then we'll need to add
-				// all the associated MDs to the defs slice
-				for _, defToAdd := range defsByNames[name] {
+				// if any of the defs for a given nameWithTags is not stale, then we need to load
+				// all the defs for that nameWithTags.
+				for _, defToAdd := range defsByNames[nameWithTags] {
 					defs = append(defs, *defToAdd)
 				}
 				continue NAMES
@@ -442,7 +442,7 @@ func (c *CasIdx) processWriteQueue() {
 	qry := `INSERT INTO metric_idx (id, orgid, partition, name, interval, unit, mtype, tags, lastupdate) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
 	for req = range c.writeQueue {
 		if err != nil {
-			log.Errorf("Failed to marshal metricDef. %s", err)
+			log.Errorf("Failed to marshal metricDef: %s. value was: %+v", err, *req.def)
 			continue
 		}
 		statQueryInsertWaitDuration.Value(time.Since(req.recvTime))
@@ -466,7 +466,7 @@ func (c *CasIdx) processWriteQueue() {
 				statQueryInsertFail.Inc()
 				errmetrics.Inc(err)
 				if (attempts % 20) == 0 {
-					log.Warnf("cassandra-idx: Failed to write def to cassandra. it will be retried. %s", err)
+					log.Warnf("cassandra-idx: Failed to write def to cassandra. it will be retried. %s. the value was: %+v", err, *req.def)
 				}
 				sleepTime := 100 * attempts
 				if sleepTime > 2000 {
@@ -478,7 +478,7 @@ func (c *CasIdx) processWriteQueue() {
 				success = true
 				statQueryInsertExecDuration.Value(time.Since(pre))
 				statQueryInsertOk.Inc()
-				log.Debugf("cassandra-idx: metricDef saved to cassandra. %s", req.def.Id)
+				log.Debugf("cassandra-idx: metricDef %s saved to cassandra", req.def.Id)
 			}
 		}
 	}
@@ -514,7 +514,7 @@ func (c *CasIdx) deleteDef(key schema.MKey, part int32) error {
 		if err != nil {
 			statQueryDeleteFail.Inc()
 			errmetrics.Inc(err)
-			log.Errorf("cassandra-idx: Failed to delete metricDef %s from cassandra. %s", keyStr, err)
+			log.Warnf("cassandra-idx: Failed to delete metricDef %s from cassandra: %s", keyStr, err)
 			time.Sleep(time.Second)
 		} else {
 			statQueryDeleteOk.Inc()
@@ -528,7 +528,7 @@ func (c *CasIdx) deleteDef(key schema.MKey, part int32) error {
 func (c *CasIdx) deleteDefAsync(key schema.MKey, part int32) {
 	go func() {
 		if err := c.deleteDef(key, part); err != nil {
-			log.Errorf(err.Error())
+			log.Errorf("cassandra-idx: %s", err.Error())
 		}
 	}()
 }
