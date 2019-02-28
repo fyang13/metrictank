@@ -10,18 +10,18 @@ import (
 	"strings"
 	"time"
 
-	schema "gopkg.in/raintank/schema.v1"
-
-	log "github.com/Sirupsen/logrus"
 	"github.com/gocql/gocql"
 	"github.com/grafana/metrictank/cluster"
 	"github.com/grafana/metrictank/cluster/partitioner"
 	"github.com/grafana/metrictank/idx"
 	"github.com/grafana/metrictank/idx/cassandra"
+	"github.com/grafana/metrictank/logger"
 	"github.com/grafana/metrictank/mdata/chunk"
 	"github.com/grafana/metrictank/mdata/chunk/archive"
 	cassandraStore "github.com/grafana/metrictank/store/cassandra"
 	"github.com/raintank/dur"
+	"github.com/raintank/schema"
+	log "github.com/sirupsen/logrus"
 )
 
 var (
@@ -68,7 +68,7 @@ var (
 		"If true existing chunks may be overwritten",
 	)
 
-	gitHash = "(none)"
+	version = "(none)"
 )
 
 type Server struct {
@@ -77,6 +77,13 @@ type Server struct {
 	Partitioner partitioner.Partitioner
 	Index       idx.MetricIndex
 	HTTPServer  *http.Server
+}
+
+func init() {
+	formatter := &logger.TextFormatter{}
+	formatter.TimestampFormat = "2006-01-02 15:04:05.000"
+	log.SetFormatter(formatter)
+	log.SetLevel(log.InfoLevel)
 }
 
 func main() {
@@ -89,14 +96,14 @@ func main() {
 	globalFlags.StringVar(&storeConfig.Keyspace, "cassandra-keyspace", storeConfig.Keyspace, "cassandra keyspace to use for storing the metric data table")
 	globalFlags.StringVar(&storeConfig.Consistency, "cassandra-consistency", storeConfig.Consistency, "write consistency (any|one|two|three|quorum|all|local_quorum|each_quorum|local_one")
 	globalFlags.StringVar(&storeConfig.HostSelectionPolicy, "cassandra-host-selection-policy", storeConfig.HostSelectionPolicy, "")
-	globalFlags.IntVar(&storeConfig.Timeout, "cassandra-timeout", storeConfig.Timeout, "cassandra timeout in milliseconds")
+	globalFlags.StringVar(&storeConfig.Timeout, "cassandra-timeout", storeConfig.Timeout, "cassandra timeout")
 	globalFlags.IntVar(&storeConfig.ReadConcurrency, "cassandra-read-concurrency", storeConfig.ReadConcurrency, "max number of concurrent reads to cassandra.")
 	globalFlags.IntVar(&storeConfig.WriteConcurrency, "cassandra-write-concurrency", storeConfig.WriteConcurrency, "max number of concurrent writes to cassandra.")
 	globalFlags.IntVar(&storeConfig.ReadQueueSize, "cassandra-read-queue-size", storeConfig.ReadQueueSize, "max number of outstanding reads before reads will be dropped. This is important if you run queries that result in many reads in parallel.")
 	//flag.IntVar(&storeConfig.WriteQueueSize, "write-queue-size", storeConfig.WriteQueueSize, "write queue size per cassandra worker. should be large engough to hold all at least the total number of series expected, divided by how many workers you have")
 	globalFlags.IntVar(&storeConfig.Retries, "cassandra-retries", storeConfig.Retries, "how many times to retry a query before failing it")
 	globalFlags.IntVar(&storeConfig.WindowFactor, "cassandra-window-factor", storeConfig.WindowFactor, "size of compaction window relative to TTL")
-	globalFlags.IntVar(&storeConfig.OmitReadTimeout, "cassandra-omit-read-timeout", storeConfig.OmitReadTimeout, "if a read is older than this, it will directly be omitted without executing")
+	globalFlags.StringVar(&storeConfig.OmitReadTimeout, "cassandra-omit-read-timeout", storeConfig.OmitReadTimeout, "if a read is older than this, it will directly be omitted without executing")
 	globalFlags.IntVar(&storeConfig.CqlProtocolVersion, "cql-protocol-version", storeConfig.CqlProtocolVersion, "cql protocol version to use")
 	globalFlags.BoolVar(&storeConfig.CreateKeyspace, "cassandra-create-keyspace", storeConfig.CreateKeyspace, "enable the creation of the mdata keyspace and tables, only one node needs this")
 	globalFlags.BoolVar(&storeConfig.DisableInitialHostLookup, "cassandra-disable-initial-host-lookup", storeConfig.DisableInitialHostLookup, "instruct the driver to not attempt to get host info from the system.peers table")
@@ -147,7 +154,8 @@ func main() {
 
 	globalFlags.Parse(os.Args[1:cassI])
 	cassFlags.Parse(os.Args[cassI+1 : len(os.Args)])
-	cassandra.Enabled = true
+	cassandra.CliConfig.Enabled = true
+	cassandra.ConfigProcess()
 
 	if *verbose {
 		log.SetLevel(log.DebugLevel)
@@ -172,13 +180,13 @@ func main() {
 		panic(fmt.Sprintf("Failed to instantiate partitioner: %q", err))
 	}
 
-	cluster.Init("mt-whisper-importer-writer", gitHash, time.Now(), "http", int(80))
+	cluster.Init("mt-whisper-importer-writer", version, time.Now(), "http", int(80))
 
 	server := &Server{
 		Session:     store.Session,
 		TTLTables:   ttlTables,
 		Partitioner: p,
-		Index:       cassandra.New(),
+		Index:       cassandra.New(cassandra.CliConfig),
 		HTTPServer: &http.Server{
 			Addr:        *httpEndpoint,
 			ReadTimeout: 10 * time.Minute,
@@ -266,11 +274,11 @@ func (s *Server) insertChunks(table, id string, ttl uint32, itergens []chunk.Ite
 	}
 	log.Debug(query)
 	for _, ig := range itergens {
-		rowKey := fmt.Sprintf("%s_%d", id, ig.Ts/cassandraStore.Month_sec)
+		rowKey := fmt.Sprintf("%s_%d", id, ig.T0/cassandraStore.Month_sec)
 		success := false
 		attempts := 0
 		for !success {
-			err := s.Session.Query(query, rowKey, ig.Ts, cassandraStore.PrepareChunkData(ig.Span, ig.Bytes())).Exec()
+			err := s.Session.Query(query, rowKey, ig.T0, ig.B).Exec()
 			if err != nil {
 				if (attempts % 20) == 0 {
 					log.Warnf("CS: failed to save chunk to cassandra after %d attempts. %s", attempts+1, err)

@@ -1,11 +1,18 @@
 package cache
 
 import (
+	"errors"
+	"fmt"
+	"math/rand"
+	"reflect"
+	"sort"
 	"testing"
+	"time"
 
+	"github.com/grafana/metrictank/mdata/cache/accnt"
 	"github.com/grafana/metrictank/mdata/chunk"
 	"github.com/grafana/metrictank/test"
-	"gopkg.in/raintank/schema.v1"
+	"github.com/raintank/schema"
 )
 
 func generateChunks(b testing.TB, startAt, count, step uint32) []chunk.IterGen {
@@ -32,7 +39,7 @@ func TestAddAsc(t *testing.T) {
 		prev := uint32(1)
 		for _, chunk := range chunks {
 			ccm.Add(prev, chunk)
-			prev = chunk.Ts
+			prev = chunk.T0
 		}
 	})
 }
@@ -94,12 +101,12 @@ func testRun(t *testing.T, run func(*CCacheMetric)) {
 		t.Fatalf("Expected result to be complete, but it was not")
 	}
 
-	if res.Start[0].Ts != 20 {
-		t.Fatalf("Expected result to start at 20, but had %d", res.Start[0].Ts)
+	if res.Start[0].T0 != 20 {
+		t.Fatalf("Expected result to start at 20, but had %d", res.Start[0].T0)
 	}
 
-	if res.Start[len(res.Start)-1].Ts != 40 {
-		t.Fatalf("Expected result to start at 40, but had %d", res.Start[len(res.Start)-1].Ts)
+	if res.Start[len(res.Start)-1].T0 != 40 {
+		t.Fatalf("Expected result to start at 40, but had %d", res.Start[len(res.Start)-1].T0)
 	}
 }
 
@@ -111,7 +118,7 @@ func BenchmarkAddAsc(b *testing.B) {
 	b.ResetTimer()
 	for _, chunk := range chunks {
 		ccm.Add(prev, chunk)
-		prev = chunk.Ts
+		prev = chunk.T0
 	}
 }
 
@@ -186,4 +193,167 @@ func BenchmarkAddRangeDesc64(b *testing.B) {
 	for i := len(chunks) - 64; i >= 0; i -= 64 {
 		ccm.AddRange(0, chunks[i:i+64])
 	}
+}
+
+func TestCorruptionCase1(t *testing.T) {
+	testRun(t, func(ccm *CCacheMetric) {
+		chunks := generateChunks(t, 10, 6, 10)
+		ccm.AddRange(0, chunks[3:6])
+		ccm.AddRange(0, chunks[0:4])
+		if err := verifyCcm(ccm, []uint32{10, 20, 30, 40, 50, 60}); err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
+func getRandomNumber(min, max int) int {
+	return rand.Intn(max-min) + min
+}
+
+// getRandomRange returns a range start-end so that
+// end >= start and both numbers drawn from [min, max)
+func getRandomRange(min, max int) (int, int) {
+	number1 := getRandomNumber(min, max)
+	number2 := getRandomNumber(min, max)
+	if number1 > number2 {
+		return number2, number1
+	} else {
+		return number1, number2
+	}
+}
+
+func TestCorruptionCase2(t *testing.T) {
+	rand.Seed(time.Now().Unix())
+	_, ccm := getCCM()
+	iterations := 100000
+	var cached [100]bool // tracks which chunks should be cached
+	var expKeys []uint32 // tracks which keys should be in the CCM
+
+	// 100 chunks, first t0=10, last is t0=1000
+	chunks := generateChunks(t, 10, 100, 10)
+
+	var opAdd, opAddRange, opDel, opDelRange int
+	var adds, dels int
+
+	for i := 0; i < iterations; i++ {
+		// 0 = Add
+		// 1 = AddRange
+		// 2 = Del
+		// 3 = Del range (via multi del cals)
+		action := getRandomNumber(0, 4)
+		switch action {
+		case 0:
+			chunk := getRandomNumber(0, 100)
+			//t.Logf("adding chunk %d", chunk)
+			ccm.Add(0, chunks[chunk])
+			cached[chunk] = true
+			opAdd++
+			adds++
+		case 1:
+			from, to := getRandomRange(0, 100)
+			//t.Logf("adding range %d-%d", from, to)
+			ccm.AddRange(0, chunks[from:to])
+			for chunk := from; chunk < to; chunk++ {
+				cached[chunk] = true
+			}
+			adds += (to - from)
+			opAddRange++
+		case 2:
+			chunk := getRandomNumber(0, 100)
+			//t.Logf("deleting chunk %d", chunk)
+			ccm.Del(chunks[chunk].T0) // note: chunk may not exist
+			cached[chunk] = false
+			opDel++
+			dels++
+		case 3:
+			from, to := getRandomRange(0, 100)
+			//t.Logf("deleting range %d-%d", from, to)
+			for chunk := from; chunk < to; chunk++ {
+				ccm.Del(chunks[chunk].T0) // note: chunk may not exist
+				cached[chunk] = false
+			}
+			opDelRange++
+			dels += (to - from)
+		}
+
+		expKeys = expKeys[:0]
+		for i, c := range cached {
+			if c {
+				expKeys = append(expKeys, uint32((i+1)*10))
+			}
+		}
+
+		if err := verifyCcm(ccm, expKeys); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	fmt.Printf("operations: add %d - addRange %d - del %d - delRange %d\n", opAdd, opAddRange, opDel, opDelRange)
+	fmt.Printf("total chunk adds %d - total chunk deletes %d\n", adds, dels)
+}
+
+// verifyCcm verifies the integrity of a CCacheMetric
+// it assumes that all itergens are span-aware
+func verifyCcm(ccm *CCacheMetric, expKeys []uint32) error {
+	var chunk *CCacheChunk
+	var ok bool
+
+	if len(ccm.chunks) != len(ccm.keys) {
+		return errors.New("Length of ccm.chunks does not match ccm.keys")
+	}
+
+	if !sort.IsSorted(accnt.Uint32Asc(ccm.keys)) {
+		return errors.New("keys are not sorted")
+	}
+
+	if !reflect.DeepEqual(ccm.keys, expKeys) {
+		return fmt.Errorf("keys mismatch. expected %v, got %v", expKeys, ccm.keys)
+	}
+
+	for i, ts := range ccm.keys {
+		if chunk, ok = ccm.chunks[ts]; !ok {
+			return fmt.Errorf("Ts %d is in ccm.keys but not in ccm.chunks", ts)
+		}
+
+		if i == 0 {
+			if chunk.Prev != 0 {
+				return errors.New("First chunk has Prev != 0")
+			}
+		} else {
+			if chunk.Prev == 0 {
+				if ccm.chunks[ccm.keys[i-1]].Ts == chunk.Ts-chunk.Itgen.Span() {
+					return fmt.Errorf("Chunk of ts %d has Prev == 0, but the previous chunk is present", ts)
+				}
+			} else {
+				if ccm.chunks[ccm.keys[i-1]].Ts != chunk.Prev {
+					return fmt.Errorf("Chunk of ts %d has Prev set to wrong ts %d but should be %d", ts, chunk.Prev, ccm.chunks[ccm.keys[i-1]].Ts)
+				}
+			}
+		}
+
+		if i == len(ccm.keys)-1 {
+			if chunk.Next != 0 {
+				return fmt.Errorf("Next of last chunk should be 0, but it's %d", chunk.Next)
+			}
+
+			// all checks completed
+			break
+		}
+
+		var nextChunk *CCacheChunk
+		if nextChunk, ok = ccm.chunks[ccm.keys[i+1]]; !ok {
+			return fmt.Errorf("Ts %d is in ccm.keys but not in ccm.chunks", ccm.keys[i+1])
+		}
+
+		if chunk.Next == 0 {
+			if chunk.Ts+chunk.Itgen.Span() == nextChunk.Ts {
+				return fmt.Errorf("Next of chunk at ts %d is set to 0, but the next chunk is present", ts)
+			}
+		} else {
+			if chunk.Next != nextChunk.Ts {
+				return fmt.Errorf("Next of chunk at ts %d is set to %d, but it should be %d", ts, chunk.Next, nextChunk.Ts)
+			}
+		}
+	}
+	return nil
 }

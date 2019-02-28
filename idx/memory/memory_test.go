@@ -13,8 +13,8 @@ import (
 	"github.com/grafana/metrictank/idx"
 	"github.com/grafana/metrictank/mdata"
 	"github.com/grafana/metrictank/test"
+	"github.com/raintank/schema"
 	. "github.com/smartystreets/goconvey/convey"
-	"gopkg.in/raintank/schema.v1"
 )
 
 // getSeriesNames returns a count-length slice of random strings comprised of the prefix and count nodes.like.this
@@ -266,7 +266,7 @@ func testFind(t *testing.T) {
 		So(nodes, ShouldHaveLength, 0)
 	})
 
-	Convey("When searching nodes that dont exist", t, func() {
+	Convey("When searching nodes that don't exist", t, func() {
 		nodes, err := ix.Find(1, "foo.demo.blah.*", 0)
 		So(err, ShouldBeNil)
 		So(nodes, ShouldHaveLength, 0)
@@ -569,11 +569,48 @@ func testMixedBranchLeafDelete(t *testing.T) {
 }
 
 func TestPruneTaggedSeries(t *testing.T) {
+
+	IndexRules = conf.IndexRules{
+		Rules: []conf.IndexRule{
+			{
+				Name:     "longterm",
+				Pattern:  regexp.MustCompile("^long"),
+				MaxStale: time.Minute,
+			},
+		},
+		Default: conf.IndexRule{
+			Name:     "default",
+			Pattern:  regexp.MustCompile(""),
+			MaxStale: 0,
+		},
+	}
 	ix := New()
 	ix.Init()
 
 	// add old series
-	series := getMetricData(1, 2, 5, 10, "metric.bah", true)
+	series := getMetricData(1, 2, 5, 10, "longterm.old", true)
+	for _, s := range series {
+		s.Time = 1
+		s.SetId()
+		mkey, err := schema.MKeyFromString(s.Id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ix.AddOrUpdate(mkey, s, 1)
+	}
+	series = getMetricData(1, 2, 5, 10, "longterm.more-recent", true)
+	for _, s := range series {
+		s.Time = 50
+		s.SetId()
+		mkey, err := schema.MKeyFromString(s.Id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ix.AddOrUpdate(mkey, s, 1)
+	}
+
+	// data that will never expire due to the default
+	series = getMetricData(1, 2, 5, 10, "metric.never.expire", true)
 	for _, s := range series {
 		s.Time = 1
 		s.SetId()
@@ -584,68 +621,80 @@ func TestPruneTaggedSeries(t *testing.T) {
 		ix.AddOrUpdate(mkey, s, 1)
 	}
 
-	// add new series
-	series = getMetricData(1, 2, 5, 10, "metric.foo", true)
-	for _, s := range series {
-		s.Time = 10
-		s.SetId()
-		mkey, err := schema.MKeyFromString(s.Id)
-		if err != nil {
-			t.Fatal(err)
-		}
-		ix.AddOrUpdate(mkey, s, 1)
-	}
-
 	Convey("after populating index", t, func() {
 		defs := ix.List(1)
-		So(defs, ShouldHaveLength, 10)
+		So(defs, ShouldHaveLength, 15)
 	})
 
-	Convey("When purging old series", t, func() {
-		purged, err := ix.Prune(time.Unix(2, 0))
+	Convey("When pruning old series", t, func() {
+		pruned, err := ix.Prune(time.Unix(100, 0)) // old series should be gone
 		So(err, ShouldBeNil)
-		So(purged, ShouldHaveLength, 5)
-		nodes, err := ix.FindByTag(1, []string{"name=~metric\\.bah.*", "series_id=~[0-4]"}, 0)
+		So(pruned, ShouldHaveLength, 5)
+		nodes, err := ix.FindByTag(1, []string{"name=~longterm\\.old.*", "series_id=~[0-4]"}, 0)
 		So(err, ShouldBeNil)
 		So(nodes, ShouldHaveLength, 0)
-		nodes, err = ix.FindByTag(1, []string{"name=~metric\\.foo.*", "series_id=~[0-4]"}, 0)
+		nodes, err = ix.FindByTag(1, []string{"name=~longterm.*", "series_id=~[0-4]"}, 0)
+		So(err, ShouldBeNil)
+		So(nodes, ShouldHaveLength, 5)
+		nodes, err = ix.FindByTag(1, []string{"name=~metric\\.never\\.exp.*", "series_id=~[0-4]"}, 0)
 		So(err, ShouldBeNil)
 		So(nodes, ShouldHaveLength, 5)
 	})
 
-	Convey("after purge", t, func() {
+	Convey("after pruning again but more aggressively", t, func() {
 		defs := ix.List(1)
-		So(defs, ShouldHaveLength, 5)
-		data := &schema.MetricData{
-			Name:     defs[0].Name,
-			Id:       defs[0].Id.String(),
-			Tags:     defs[0].Tags,
-			Mtype:    defs[0].Mtype,
-			OrgId:    1,
-			Interval: 10,
-			Time:     100,
+		So(defs, ShouldHaveLength, 10)
+		// find one of the longterm ones and update it
+		// to a more recent time that will survive the next prune
+		var data *schema.MetricData
+		for _, def := range defs {
+			if strings.HasPrefix(def.Name, "longterm") {
+				data = &schema.MetricData{
+					Name:     def.Name,
+					Id:       def.Id.String(),
+					Tags:     def.Tags,
+					Mtype:    def.Mtype,
+					OrgId:    1,
+					Interval: 10,
+					Time:     100,
+				}
+				data.SetId()
+			}
 		}
-		data.SetId()
 		mkey, err := schema.MKeyFromString(data.Id)
 		if err != nil {
 			t.Fatal(err)
 		}
 		ix.AddOrUpdate(mkey, data, 1)
-		Convey("When purging old series", func() {
-			purged, err := ix.Prune(time.Unix(12, 0))
+		Convey("When pruning old series", func() {
+			pruned, err := ix.Prune(time.Unix(120, 0))
 			So(err, ShouldBeNil)
-			So(purged, ShouldHaveLength, 4)
-			nodes, err := ix.FindByTag(1, []string{"name=~metric\\.foo.*", "series_id=~[0-4]"}, 0)
+			So(pruned, ShouldHaveLength, 4)
+			nodes, err := ix.FindByTag(1, []string{"name=~longterm", "series_id=~[0-4]"}, 0)
 			So(err, ShouldBeNil)
 			So(nodes, ShouldHaveLength, 1)
+			nodes, err = ix.FindByTag(1, []string{"name=~metric\\.never.*", "series_id=~[0-4]"}, 0)
+			So(err, ShouldBeNil)
+			So(nodes, ShouldHaveLength, 5)
 		})
 	})
 }
 
+// this function just tests the collision aspect.
+// it does not test matching over different rules or tag matching
+// we have other tests for that
 func TestPruneTaggedSeriesWithCollidingTagSets(t *testing.T) {
 	_tagSupport := TagSupport
 	defer func() { TagSupport = _tagSupport }()
 	TagSupport = true
+
+	IndexRules = conf.IndexRules{
+		Default: conf.IndexRule{
+			Name:     "default",
+			Pattern:  regexp.MustCompile(""),
+			MaxStale: time.Second,
+		},
+	}
 
 	ix := New()
 	ix.Init()
@@ -678,13 +727,13 @@ func TestPruneTaggedSeriesWithCollidingTagSets(t *testing.T) {
 		findExpressions = append(findExpressions, tag)
 	}
 
-	Convey("When purging old series", t, func() {
-		purged, err := ix.Prune(time.Unix(2, 0))
+	Convey("When pruning old series", t, func() {
+		pruned, err := ix.Prune(time.Unix(11, 0)) // time=1 is too old, time=10 is recent enough and causes first one to also stick around
 		So(err, ShouldBeNil)
-		So(purged, ShouldHaveLength, 0)
+		So(pruned, ShouldHaveLength, 0)
 	})
 
-	Convey("After purge", t, func() {
+	Convey("After pruning", t, func() {
 		nodes, err := ix.FindByTag(1, findExpressions, 0)
 		So(err, ShouldBeNil)
 		So(nodes, ShouldHaveLength, 1)
@@ -695,13 +744,13 @@ func TestPruneTaggedSeriesWithCollidingTagSets(t *testing.T) {
 		So(defs, ShouldHaveLength, 2)
 	})
 
-	Convey("When purging newer series", t, func() {
-		purged, err := ix.Prune(time.Unix(20, 0))
+	Convey("When pruning newer series", t, func() {
+		pruned, err := ix.Prune(time.Unix(20, 0))
 		So(err, ShouldBeNil)
-		So(purged, ShouldHaveLength, 2)
+		So(pruned, ShouldHaveLength, 2)
 	})
 
-	Convey("After purge", t, func() {
+	Convey("After pruning", t, func() {
 		nodes, err := ix.FindByTag(1, findExpressions, 0)
 		So(err, ShouldBeNil)
 		So(nodes, ShouldHaveLength, 0)
@@ -713,6 +762,14 @@ func TestPrune(t *testing.T) {
 }
 
 func testPrune(t *testing.T) {
+	IndexRules = conf.IndexRules{
+		Default: conf.IndexRule{
+			Name:     "default",
+			Pattern:  regexp.MustCompile(""),
+			MaxStale: time.Second,
+		},
+	}
+
 	ix := New()
 	ix.Init()
 
@@ -750,10 +807,10 @@ func testPrune(t *testing.T) {
 		defs := ix.List(1)
 		So(defs, ShouldHaveLength, 10)
 	})
-	Convey("When purging old series", t, func() {
-		purged, err := ix.Prune(time.Unix(2, 0))
+	Convey("When pruning old series", t, func() {
+		pruned, err := ix.Prune(time.Unix(11, 0))
 		So(err, ShouldBeNil)
-		So(purged, ShouldHaveLength, 5)
+		So(pruned, ShouldHaveLength, 5)
 		nodes, err := ix.Find(1, "metric.bah.*", 0)
 		So(err, ShouldBeNil)
 		So(nodes, ShouldHaveLength, 0)
@@ -762,7 +819,7 @@ func testPrune(t *testing.T) {
 		So(nodes, ShouldHaveLength, 5)
 
 	})
-	Convey("after purge", t, func() {
+	Convey("after pruning", t, func() {
 		defs := ix.List(1)
 		So(defs, ShouldHaveLength, 5)
 		data := &schema.MetricData{
@@ -778,10 +835,10 @@ func testPrune(t *testing.T) {
 			t.Fatal(err)
 		}
 		ix.AddOrUpdate(mkey, data, 0)
-		Convey("When purging old series", func() {
-			purged, err := ix.Prune(time.Unix(12, 0))
+		Convey("When pruning old series", func() {
+			pruned, err := ix.Prune(time.Unix(12, 0))
 			So(err, ShouldBeNil)
-			So(purged, ShouldHaveLength, 4)
+			So(pruned, ShouldHaveLength, 4)
 			nodes, err := ix.Find(1, "metric.foo.*", 0)
 			So(err, ShouldBeNil)
 			So(nodes, ShouldHaveLength, 1)
@@ -857,6 +914,72 @@ func BenchmarkDeletes(b *testing.B) {
 	ix.Delete(1, "some.*")
 }
 
+func BenchmarkPrune(b *testing.B) {
+	ix := New()
+	ix.Init()
+
+	var data *schema.MetricData
+	var key string
+	for i := 1; i <= b.N; i++ {
+		key = fmt.Sprintf("some.metric.%d.%d", i, i)
+		data = &schema.MetricData{
+			Name:     key,
+			OrgId:    1,
+			Interval: 10,
+			Time:     100,
+		}
+		data.SetId()
+		mkey, err := schema.MKeyFromString(data.Id)
+		if err != nil {
+			b.Fatal(err)
+		}
+		ix.AddOrUpdate(mkey, data, 1)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	items, err := ix.Prune(time.Unix(200, 0))
+	if err != nil {
+		b.Fatal(err)
+	}
+	if len(items) != b.N {
+		b.Fatalf("only %d of %d items pruned", len(items), b.N)
+	}
+}
+
+func BenchmarkPruneLongSeriesNames(b *testing.B) {
+	ix := New()
+	ix.Init()
+
+	var data *schema.MetricData
+	var key string
+	for i := 1; i <= b.N; i++ {
+		key = fmt.Sprintf("stats.%d.some.really.long.metric.that.is.slow.to.delete.and.really.hurts.pruning.performance", i)
+		data = &schema.MetricData{
+			Name:     key,
+			OrgId:    1,
+			Interval: 10,
+			Time:     100,
+		}
+		data.SetId()
+		mkey, err := schema.MKeyFromString(data.Id)
+		if err != nil {
+			b.Fatal(err)
+		}
+		ix.AddOrUpdate(mkey, data, 1)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	items, err := ix.Prune(time.Unix(200, 0))
+	if err != nil {
+		b.Fatal(err)
+	}
+	if len(items) != b.N {
+		b.Fatalf("only %d of %d items pruned", len(items), b.N)
+	}
+}
+
 func TestMatchSchemaWithTags(t *testing.T) {
 	_tagSupport := TagSupport
 	_schemas := mdata.Schemas
@@ -868,7 +991,7 @@ func TestMatchSchemaWithTags(t *testing.T) {
 		{
 			Name:       "tag1_is_value3_or_value5",
 			Pattern:    regexp.MustCompile(".*;tag1=value[35](;.*|$)"),
-			Retentions: conf.Retentions([]conf.Retention{conf.NewRetentionMT(1, 3600*24*1, 600, 2, true)}),
+			Retentions: conf.Retentions([]conf.Retention{conf.NewRetentionMT(1, 3600*24*1, 600, 2, 0)}),
 		},
 	})
 

@@ -1,4 +1,5 @@
 #!/bin/bash
+set -e
 
 # turns the metrictank-sample.ini into a nice markdown document.
 # headers like h3 and h2 are printed as-is, and the lines between them (config items and their comments)
@@ -59,6 +60,7 @@ cat << EOF
 Metrictank comes with an [example main config file](https://github.com/grafana/metrictank/blob/master/metrictank-sample.ini),
 a [storage-schemas.conf file](https://github.com/grafana/metrictank/blob/master/scripts/config/storage-schemas.conf) and
 a [storage-aggregation.conf file](https://github.com/grafana/metrictank/blob/master/scripts/config/storage-aggregation.conf)
+an [index-rules.conf file](https://github.com/grafana/metrictank/blob/master/scripts/config/index-rules.conf)
 
 The files themselves are well documented, but for your convenience, they are replicated below.  
 
@@ -69,7 +71,7 @@ Settings within section names in the config just require you to prefix the secti
 Examples:
 
 \`\`\`
-MT_LOG_LEVEL: 1                           # MT_<setting_name>
+MT_LOG_LEVEL: info                        # MT_<setting_name>
 MT_CASSANDRA_WRITE_CONCURRENCY: 10        # MT_<setting_name>
 MT_KAFKA_MDM_IN_DATA_DIR: /your/data/dir  # MT_<section_title>_<setting_name>
 \`\`\`
@@ -86,11 +88,12 @@ process metrictank-sample.ini
 
 cat << EOF
 
-# storage-schemas.conf
+# index-rules.conf
 
 \`\`\`
 EOF
-cat scripts/config/storage-schemas.conf
+
+cat scripts/config/index-rules.conf
 
 cat << EOF
 \`\`\`
@@ -101,6 +104,16 @@ cat << EOF
 EOF
 
 cat scripts/config/storage-aggregation.conf
+
+cat << EOF
+\`\`\`
+
+# storage-schemas.conf
+
+\`\`\`
+EOF
+
+cat scripts/config/storage-schemas.conf
 
 cat << EOF
 \`\`\`

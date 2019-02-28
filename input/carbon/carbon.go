@@ -4,19 +4,20 @@ package carbon
 
 import (
 	"bufio"
+	"context"
 	"flag"
 	"io"
 	"net"
 	"strings"
 	"sync"
 
+	"github.com/grafana/globalconf"
 	"github.com/grafana/metrictank/cluster"
 	"github.com/grafana/metrictank/input"
 	"github.com/grafana/metrictank/stats"
 	"github.com/metrics20/go-metrics20/carbon20"
-	"github.com/raintank/worldping-api/pkg/log"
-	"github.com/rakyll/globalconf"
-	"gopkg.in/raintank/schema.v1"
+	"github.com/raintank/schema"
+	log "github.com/sirupsen/logrus"
 )
 
 // metric input.carbon.metrics_per_message is how many metrics per message were seen. in carbon's case this is always 1.
@@ -80,7 +81,7 @@ func ConfigSetup() {
 	inCarbon.BoolVar(&Enabled, "enabled", false, "")
 	inCarbon.StringVar(&addr, "addr", ":2003", "tcp listen address")
 	inCarbon.IntVar(&partitionId, "partition", 0, "partition Id.")
-	globalconf.Register("carbon-in", inCarbon)
+	globalconf.Register("carbon-in", inCarbon, flag.ExitOnError)
 }
 
 func ConfigProcess() {
@@ -93,7 +94,7 @@ func ConfigProcess() {
 func New() *Carbon {
 	addrT, err := net.ResolveTCPAddr("tcp", addr)
 	if err != nil {
-		log.Fatal(4, "carbon-in: %s", err.Error())
+		log.Fatalf("carbon-in: %s", err.Error())
 	}
 	return &Carbon{
 		addrStr:   addr,
@@ -106,15 +107,15 @@ func (c *Carbon) IntervalGetter(i IntervalGetter) {
 	c.intervalGetter = i
 }
 
-func (c *Carbon) Start(handler input.Handler, fatal chan struct{}) error {
+func (c *Carbon) Start(handler input.Handler, cancel context.CancelFunc) error {
 	c.Handler = handler
 	l, err := net.ListenTCP("tcp", c.addr)
 	if nil != err {
-		log.Error(4, "carbon-in: %s", err.Error())
+		log.Errorf("carbon-in: %s", err.Error())
 		return err
 	}
 	c.listener = l
-	log.Info("carbon-in: listening on %v/tcp", c.addr)
+	log.Infof("carbon-in: listening on %v/tcp", c.addr)
 	c.quit = make(chan struct{})
 	go c.accept()
 	return nil
@@ -140,7 +141,7 @@ func (c *Carbon) accept() {
 				return
 			default:
 			}
-			log.Error(4, "carbon-in: Accept Error: %s", err.Error())
+			log.Errorf("carbon-in: Accept Error: %s", err.Error())
 			return
 		}
 		c.handlerWaitGroup.Add(1)
@@ -150,7 +151,7 @@ func (c *Carbon) accept() {
 }
 
 func (c *Carbon) Stop() {
-	log.Info("carbon-in: shutting down.")
+	log.Infof("carbon-in: shutting down.")
 	close(c.quit)
 	c.listener.Close()
 	c.connTrack.CloseAll()
@@ -176,7 +177,7 @@ func (c *Carbon) handle(conn net.Conn) {
 			default:
 			}
 			if io.EOF != err {
-				log.Error(4, "carbon-in: Recv error: %s", err.Error())
+				log.Errorf("carbon-in: Recv error: %s", err.Error())
 			}
 			break
 		}
@@ -185,7 +186,7 @@ func (c *Carbon) handle(conn net.Conn) {
 		key, val, ts, err := carbon20.ValidatePacket(buf, carbon20.MediumLegacy, carbon20.NoneM20)
 		if err != nil {
 			metricsDecodeErr.Inc()
-			log.Error(4, "carbon-in: invalid metric: %s", err.Error())
+			log.Errorf("carbon-in: invalid metric: %s", err.Error())
 			continue
 		}
 		nameSplits := strings.Split(string(key), ";")

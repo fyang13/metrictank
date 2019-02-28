@@ -8,7 +8,7 @@ import (
 	"github.com/grafana/metrictank/conf"
 	"github.com/grafana/metrictank/mdata/cache"
 	"github.com/grafana/metrictank/test"
-	"gopkg.in/raintank/schema.v1"
+	"github.com/raintank/schema"
 )
 
 type testcase struct {
@@ -71,7 +71,7 @@ func TestAggregator(t *testing.T) {
 		}
 		cluster.Manager.SetPrimary(false)
 	}
-	ret := conf.NewRetentionMT(60, 86400, 120, 10, true)
+	ret := conf.NewRetentionMT(60, 86400, 120, 10, 0)
 	aggs := conf.Aggregation{
 		AggregationMethod: []conf.Method{conf.Avg, conf.Min, conf.Max, conf.Sum, conf.Lst},
 	}

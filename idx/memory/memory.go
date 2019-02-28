@@ -3,27 +3,28 @@ package memory
 import (
 	"flag"
 	"fmt"
+	"os"
 	"regexp"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/grafana/globalconf"
+	"github.com/grafana/metrictank/conf"
 	"github.com/grafana/metrictank/errors"
 	"github.com/grafana/metrictank/idx"
 	"github.com/grafana/metrictank/mdata"
 	"github.com/grafana/metrictank/stats"
-	"github.com/raintank/worldping-api/pkg/log"
-	"github.com/rakyll/globalconf"
-	"gopkg.in/raintank/schema.v1"
+	"github.com/raintank/schema"
+	log "github.com/sirupsen/logrus"
 )
 
 var (
-	LogLevel int
-
-	// metric idx.memory.update is the number of updates to the memory idx
+	// metric idx.memory.ops.update is the number of updates to the memory idx
 	statUpdate = stats.NewCounter32("idx.memory.ops.update")
-	// metric idx.memory.add is the number of additions to the memory idx
+	// metric idx.memory.ops.add is the number of additions to the memory idx
 	statAdd = stats.NewCounter32("idx.memory.ops.add")
 	// metric idx.memory.add is the duration of a (successful) add of a metric to the memory idx
 	statAddDuration = stats.NewLatencyHistogram15s32("idx.memory.add")
@@ -46,10 +47,14 @@ var (
 	// metric idx.metrics_active is the number of currently known metrics in the index
 	statMetricsActive = stats.NewGauge32("idx.metrics_active")
 
-	Enabled         bool
-	matchCacheSize  int
-	TagSupport      bool
-	TagQueryWorkers int // number of workers to spin up when evaluation tag expressions
+	Enabled             bool
+	matchCacheSize      int
+	maxPruneLockTime    = time.Millisecond * 100
+	maxPruneLockTimeStr string
+	TagSupport          bool
+	TagQueryWorkers     int // number of workers to spin up when evaluation tag expressions
+	indexRulesFile      string
+	IndexRules          conf.IndexRules
 )
 
 func ConfigSetup() {
@@ -58,7 +63,28 @@ func ConfigSetup() {
 	memoryIdx.BoolVar(&TagSupport, "tag-support", false, "enables/disables querying based on tags")
 	memoryIdx.IntVar(&TagQueryWorkers, "tag-query-workers", 50, "number of workers to spin up to evaluate tag queries")
 	memoryIdx.IntVar(&matchCacheSize, "match-cache-size", 1000, "size of regular expression cache in tag query evaluation")
-	globalconf.Register("memory-idx", memoryIdx)
+	memoryIdx.StringVar(&indexRulesFile, "rules-file", "/etc/metrictank/index-rules.conf", "path to index-rules.conf file")
+	memoryIdx.StringVar(&maxPruneLockTimeStr, "max-prune-lock-time", "100ms", "Maximum duration each second a prune job can lock the index.")
+	globalconf.Register("memory-idx", memoryIdx, flag.ExitOnError)
+}
+
+func ConfigProcess() {
+	var err error
+	maxPruneLockTime, err = time.ParseDuration(maxPruneLockTimeStr)
+	if err != nil {
+		log.Fatalf("could not parse max-prune-lock-time %q: %s", maxPruneLockTimeStr, err)
+	}
+	if maxPruneLockTime > time.Second {
+		log.Fatalf("invalid max-prune-lock-time of %s. Must be <= 1 second", maxPruneLockTimeStr)
+	}
+	// read index-rules.conf
+	IndexRules, err = conf.ReadIndexRules(indexRulesFile)
+	if os.IsNotExist(err) {
+		log.Infof("Index-rules.conf file %s does not exist; using defaults", indexRulesFile)
+		IndexRules = conf.NewIndexRules()
+	} else if err != nil {
+		log.Fatalf("can't read index-rules file %q: %s", indexRulesFile, err.Error())
+	}
 }
 
 type Tree struct {
@@ -208,25 +234,35 @@ func (m *MemoryIdx) Stop() {
 	return
 }
 
+// bumpLastUpdate increases lastUpdate.
+// note:
+// * received point may be older than a previously received point, in which case the previous value was correct
+// * someone else may have just concurrently updated lastUpdate to a higher value than what we have, which we should restore
+// * by the time we look at the previous value and try to restore it, someone else may have updated it to a higher value
+// all these scenarios are unlikely but we should accommodate them anyway.
+func bumpLastUpdate(loc *int64, newVal int64) {
+	prev := atomic.SwapInt64(loc, newVal)
+	for prev > newVal {
+		newVal = prev
+		prev = atomic.SwapInt64(loc, newVal)
+	}
+}
+
 // Update updates an existing archive, if found.
 // It returns whether it was found, and - if so - the (updated) existing archive and its old partition
 func (m *MemoryIdx) Update(point schema.MetricPoint, partition int32) (idx.Archive, int32, bool) {
 	pre := time.Now()
 
-	m.Lock()
-	defer m.Unlock()
+	m.RLock()
+	defer m.RUnlock()
 
 	existing, ok := m.defById[point.MKey]
 	if ok {
-		oldPart := existing.Partition
-		if LogLevel < 2 {
-			log.Debug("metricDef with id %v already in index", point.MKey)
-		}
+		log.Debugf("memory-idx: metricDef with id %v already in index", point.MKey)
 
-		if existing.LastUpdate < int64(point.Time) {
-			existing.LastUpdate = int64(point.Time)
-		}
-		existing.Partition = partition
+		bumpLastUpdate(&existing.LastUpdate, int64(point.Time))
+
+		oldPart := atomic.SwapInt32(&existing.Partition, partition)
 		statUpdate.Inc()
 		statUpdateDuration.Value(time.Since(pre))
 		return *existing, oldPart, true
@@ -240,21 +276,24 @@ func (m *MemoryIdx) Update(point schema.MetricPoint, partition int32) (idx.Archi
 // if was new        -> adds new MetricDefinition to index
 func (m *MemoryIdx) AddOrUpdate(mkey schema.MKey, data *schema.MetricData, partition int32) (idx.Archive, int32, bool) {
 	pre := time.Now()
-	m.Lock()
-	defer m.Unlock()
+
+	// Optimistically read lock
+	m.RLock()
 
 	existing, ok := m.defById[mkey]
 	if ok {
-		oldPart := existing.Partition
-		log.Debug("metricDef with id %s already in index.", mkey)
-		if existing.LastUpdate < int64(data.Time) {
-			existing.LastUpdate = int64(data.Time)
-		}
-		existing.Partition = partition
+		log.Debugf("memory-idx: metricDef with id %s already in index.", mkey)
+		bumpLastUpdate(&existing.LastUpdate, data.Time)
+		oldPart := atomic.SwapInt32(&existing.Partition, partition)
 		statUpdate.Inc()
 		statUpdateDuration.Value(time.Since(pre))
+		m.RUnlock()
 		return *existing, oldPart, ok
 	}
+
+	m.RUnlock()
+	m.Lock()
+	defer m.Unlock()
 
 	def := schema.MetricDefinitionFromMetricData(data)
 	def.Partition = partition
@@ -295,7 +334,7 @@ func (m *MemoryIdx) indexTags(def *schema.MetricDefinition) {
 			// should never happen because every tag in the index
 			// must have a valid format
 			invalidTag.Inc()
-			log.Error(3, "memory-idx: Tag %q of id %q has an invalid format", tag, def.Id)
+			log.Errorf("memory-idx: Tag %q of id %q has an invalid format", tag, def.Id)
 			continue
 		}
 
@@ -320,7 +359,7 @@ func (m *MemoryIdx) deindexTags(tags TagIndex, def *schema.MetricDefinition) boo
 			// should never happen because every tag in the index
 			// must have a valid format
 			invalidTag.Inc()
-			log.Error(3, "memory-idx: Tag %q of id %q has an invalid format", tag, def.Id)
+			log.Errorf("memory-idx: Tag %q of id %q has an invalid format", tag, def.Id)
 			continue
 		}
 
@@ -356,7 +395,7 @@ func (m *MemoryIdx) Load(defs []schema.MetricDefinition) int {
 		}
 
 		// as we are loading the metricDefs from a persistent store, set the lastSave
-		// to the lastUpdate timestamp.  This wont exactly match the true lastSave Timstamp,
+		// to the lastUpdate timestamp.  This won't exactly match the true lastSave Timstamp,
 		// but it will be close enough and it will always be true that the lastSave was at
 		// or after this time.  For metrics that are sent at or close to real time (the typical
 		// use case), then the value will be within a couple of seconds of the true lastSave.
@@ -373,18 +412,20 @@ func (m *MemoryIdx) add(def *schema.MetricDefinition) idx.Archive {
 
 	schemaId, _ := mdata.MatchSchema(path, def.Interval)
 	aggId, _ := mdata.MatchAgg(path)
+	irId, _ := IndexRules.Match(path)
 	sort.Strings(def.Tags)
 	archive := &idx.Archive{
 		MetricDefinition: *def,
 		SchemaId:         schemaId,
 		AggId:            aggId,
+		IrId:             irId,
 	}
 
 	if TagSupport && len(def.Tags) > 0 {
 		if _, ok := m.defById[def.Id]; !ok {
 			m.defById[def.Id] = archive
 			statAdd.Inc()
-			log.Debug("memory-idx: adding %s to DefById", path)
+			log.Debugf("memory-idx: adding %s to DefById", path)
 		}
 		return *archive
 	}
@@ -392,7 +433,7 @@ func (m *MemoryIdx) add(def *schema.MetricDefinition) idx.Archive {
 	//first check to see if a tree has been created for this OrgId
 	tree, ok := m.tree[def.OrgId]
 	if !ok || len(tree.Items) == 0 {
-		log.Debug("memory-idx: first metricDef seen for orgId %d", def.OrgId)
+		log.Debugf("memory-idx: first metricDef seen for orgId %d", def.OrgId)
 		root := &Node{
 			Path:     "",
 			Children: make([]string, 0),
@@ -407,7 +448,7 @@ func (m *MemoryIdx) add(def *schema.MetricDefinition) idx.Archive {
 		// An existing leaf is possible if there are multiple metricDefs for the same path due
 		// to different tags or interval
 		if node, ok := tree.Items[path]; ok {
-			log.Debug("memory-idx: existing index entry for %s. Adding %s to Defs list", path, def.Id)
+			log.Debugf("memory-idx: existing index entry for %s. Adding %s to Defs list", path, def.Id)
 			node.Defs = append(node.Defs, def.Id)
 			m.defById[def.Id] = archive
 			statAdd.Inc()
@@ -424,12 +465,12 @@ func (m *MemoryIdx) add(def *schema.MetricDefinition) idx.Archive {
 		branch := path[:pos]
 		prevNode := path[pos+1 : prevPos]
 		if n, ok := tree.Items[branch]; ok {
-			log.Debug("memory-idx: adding %s as child of %s", prevNode, n.Path)
+			log.Debugf("memory-idx: adding %s as child of %s", prevNode, n.Path)
 			n.Children = append(n.Children, prevNode)
 			break
 		}
 
-		log.Debug("memory-idx: creating branch %s with child %s", branch, prevNode)
+		log.Debugf("memory-idx: creating branch %s with child %s", branch, prevNode)
 		tree.Items[branch] = &Node{
 			Path:     branch,
 			Children: []string{prevNode},
@@ -443,13 +484,13 @@ func (m *MemoryIdx) add(def *schema.MetricDefinition) idx.Archive {
 	if pos == -1 {
 		// need to add to the root node.
 		branch := path[:prevPos]
-		log.Debug("memory-idx: no existing branches found for %s.  Adding to the root node.", branch)
+		log.Debugf("memory-idx: no existing branches found for %s.  Adding to the root node.", branch)
 		n := tree.Items[""]
 		n.Children = append(n.Children, branch)
 	}
 
 	// Add leaf node
-	log.Debug("memory-idx: creating leaf %s", path)
+	log.Debugf("memory-idx: creating leaf %s", path)
 	tree.Items[path] = &Node{
 		Path:     path,
 		Children: []string{},
@@ -537,11 +578,11 @@ func (m *MemoryIdx) TagDetails(orgId uint32, key, filter string, from int64) (ma
 				def, ok := m.defById[id]
 				if !ok {
 					corruptIndex.Inc()
-					log.Error(3, "memory-idx: corrupt. ID %q is in tag index but not in the byId lookup table", id)
+					log.Errorf("memory-idx: corrupt. ID %q is in tag index but not in the byId lookup table", id)
 					continue
 				}
 
-				if def.LastUpdate < from {
+				if atomic.LoadInt64(&def.LastUpdate) < from {
 					continue
 				}
 
@@ -693,7 +734,7 @@ func (m *MemoryIdx) FindTagValues(orgId uint32, tag, prefix string, expressions 
 				// should never happen because every ID in the tag index
 				// must be present in the byId lookup table
 				corruptIndex.Inc()
-				log.Error(3, "memory-idx: ID %q is in tag index but not in the byId lookup table", id)
+				log.Errorf("memory-idx: ID %q is in tag index but not in the byId lookup table", id)
 				continue
 			}
 
@@ -808,13 +849,13 @@ func (m *MemoryIdx) hasOneMetricFrom(tags TagIndex, tag string, from int64) bool
 			def, ok := m.defById[id]
 			if !ok {
 				corruptIndex.Inc()
-				log.Error(3, "memory-idx: corrupt. ID %q is in tag index but not in the byId lookup table", id)
+				log.Errorf("memory-idx: corrupt. ID %q is in tag index but not in the byId lookup table", id)
 				continue
 			}
 
 			// as soon as we found one metric definition with LastUpdate >= from
 			// we can return true
-			if def.LastUpdate >= from {
+			if atomic.LoadInt64(&def.LastUpdate) >= from {
 				return true
 			}
 		}
@@ -843,7 +884,7 @@ func (m *MemoryIdx) FindByTag(orgId uint32, expressions []string, from int64) ([
 		def, ok := m.defById[id]
 		if !ok {
 			corruptIndex.Inc()
-			log.Error(3, "memory-idx: corrupt. ID %q has been given, but it is not in the byId lookup table", id)
+			log.Errorf("memory-idx: corrupt. ID %q has been given, but it is not in the byId lookup table", id)
 			continue
 		}
 
@@ -892,7 +933,7 @@ func (m *MemoryIdx) Find(orgId uint32, pattern string, from int64) ([]idx.Node, 
 		}
 		matchedNodes = append(matchedNodes, publicNodes...)
 	}
-	log.Debug("memory-idx: %d nodes matching pattern %s found", len(matchedNodes), pattern)
+	log.Debugf("memory-idx: %d nodes matching pattern %s found", len(matchedNodes), pattern)
 	results := make([]idx.Node, 0)
 	byPath := make(map[string]struct{})
 	// construct the output slice of idx.Node's such that there is only 1 idx.Node
@@ -910,12 +951,12 @@ func (m *MemoryIdx) Find(orgId uint32, pattern string, from int64) ([]idx.Node, 
 				idxNode.Defs = make([]idx.Archive, 0, len(n.Defs))
 				for _, id := range n.Defs {
 					def := m.defById[id]
-					if from != 0 && def.LastUpdate < from {
+					if from != 0 && atomic.LoadInt64(&def.LastUpdate) < from {
 						statFiltered.Inc()
-						log.Debug("memory-idx: from is %d, so skipping %s which has LastUpdate %d", from, def.Id, def.LastUpdate)
+						log.Debugf("memory-idx: from is %d, so skipping %s which has LastUpdate %d", from, def.Id, atomic.LoadInt64(&def.LastUpdate))
 						continue
 					}
-					log.Debug("memory-idx Find: adding to path %s archive id=%s name=%s int=%d schemaId=%d aggId=%d lastSave=%d", n.Path, def.Id, def.Name, def.Interval, def.SchemaId, def.AggId, def.LastSave)
+					log.Debugf("memory-idx: Find: adding to path %s archive id=%s name=%s int=%d schemaId=%d aggId=%d irId=%d lastSave=%d", n.Path, def.Id, def.Name, def.Interval, def.SchemaId, def.AggId, def.IrId, def.LastSave)
 					idxNode.Defs = append(idxNode.Defs, *def)
 				}
 				if len(idxNode.Defs) == 0 {
@@ -925,10 +966,10 @@ func (m *MemoryIdx) Find(orgId uint32, pattern string, from int64) ([]idx.Node, 
 			results = append(results, idxNode)
 			byPath[n.Path] = struct{}{}
 		} else {
-			log.Debug("memory-idx: path %s already seen", n.Path)
+			log.Debugf("memory-idx: path %s already seen", n.Path)
 		}
 	}
-	log.Debug("memory-idx: %d nodes has %d unique paths.", len(matchedNodes), len(results))
+	log.Debugf("memory-idx: %d nodes has %d unique paths.", len(matchedNodes), len(results))
 	statFindDuration.Value(time.Since(pre))
 	return results, nil
 }
@@ -937,7 +978,7 @@ func (m *MemoryIdx) Find(orgId uint32, pattern string, from int64) ([]idx.Node, 
 func (m *MemoryIdx) find(orgId uint32, pattern string) ([]*Node, error) {
 	tree, ok := m.tree[orgId]
 	if !ok {
-		log.Debug("memory-idx: orgId %d has no metrics indexed.", orgId)
+		log.Debugf("memory-idx: orgId %d has no metrics indexed.", orgId)
 		return nil, nil
 	}
 
@@ -958,7 +999,7 @@ func (m *MemoryIdx) find(orgId uint32, pattern string) ([]*Node, error) {
 	pos := len(nodes)
 	for i := 0; i < len(nodes); i++ {
 		if strings.ContainsAny(nodes[i], "*{}[]?") {
-			log.Debug("memory-idx: found first pattern sequence at node %s pos %d", nodes[i], i)
+			log.Debugf("memory-idx: found first pattern sequence at node %s pos %d", nodes[i], i)
 			pos = i
 			break
 		}
@@ -967,17 +1008,17 @@ func (m *MemoryIdx) find(orgId uint32, pattern string) ([]*Node, error) {
 	if pos != 0 {
 		branch = strings.Join(nodes[:pos], ".")
 	}
-	log.Debug("memory-idx: starting search at orgId %d, node %q", orgId, branch)
+	log.Debugf("memory-idx: starting search at orgId %d, node %q", orgId, branch)
 	startNode, ok := tree.Items[branch]
 
 	if !ok {
-		log.Debug("memory-idx: branch %q does not exist in the index for orgId %d", branch, orgId)
+		log.Debugf("memory-idx: branch %q does not exist in the index for orgId %d", branch, orgId)
 		return nil, nil
 	}
 
 	if startNode == nil {
 		corruptIndex.Inc()
-		log.Error(3, "memory-idx: startNode is nil. org=%d,patt=%q,pos=%d,branch=%q", orgId, pattern, pos, branch)
+		log.Errorf("memory-idx: startNode is nil. org=%d,patt=%q,pos=%d,branch=%q", orgId, pattern, pos, branch)
 		return nil, errors.NewInternal("hit an empty path in the index")
 	}
 
@@ -994,11 +1035,11 @@ func (m *MemoryIdx) find(orgId uint32, pattern string) ([]*Node, error) {
 		var grandChildren []*Node
 		for _, c := range children {
 			if !c.HasChildren() {
-				log.Debug("memory-idx: end of branch reached at %s with no match found for %s", c.Path, pattern)
+				log.Debugf("memory-idx: end of branch reached at %s with no match found for %s", c.Path, pattern)
 				// expecting a branch
 				continue
 			}
-			log.Debug("memory-idx: searching %d children of %s that match %s", len(c.Children), c.Path, nodes[i])
+			log.Debugf("memory-idx: searching %d children of %s that match %s", len(c.Children), c.Path, nodes[i])
 			matches := matcher(c.Children)
 			for _, m := range matches {
 				newBranch := c.Path + "." + m
@@ -1008,7 +1049,7 @@ func (m *MemoryIdx) find(orgId uint32, pattern string) ([]*Node, error) {
 				grandChild := tree.Items[newBranch]
 				if grandChild == nil {
 					corruptIndex.Inc()
-					log.Error(3, "memory-idx: grandChild is nil. org=%d,patt=%q,i=%d,pos=%d,p=%q,path=%q", orgId, pattern, i, pos, p, newBranch)
+					log.Errorf("memory-idx: grandChild is nil. org=%d,patt=%q,i=%d,pos=%d,p=%q,path=%q", orgId, pattern, i, pos, p, newBranch)
 					return nil, errors.NewInternal("hit an empty path in the index")
 				}
 
@@ -1022,7 +1063,7 @@ func (m *MemoryIdx) find(orgId uint32, pattern string) ([]*Node, error) {
 		}
 	}
 
-	log.Debug("memory-idx: reached pattern length. %d nodes matched", len(children))
+	log.Debugf("memory-idx: reached pattern length. %d nodes matched", len(children))
 	return children, nil
 }
 
@@ -1106,7 +1147,7 @@ func (m *MemoryIdx) deleteTaggedByIdSet(orgId uint32, ids IdSet) []idx.Archive {
 		delete(m.defById, idStr)
 	}
 
-	statMetricsActive.Add(-1 * len(ids))
+	statMetricsActive.Set(len(m.defById))
 
 	return deletedDefs
 }
@@ -1123,9 +1164,10 @@ func (m *MemoryIdx) Delete(orgId uint32, pattern string) ([]idx.Archive, error) 
 
 	for _, f := range found {
 		deleted := m.delete(orgId, f, true, true)
-		statMetricsActive.DecUint32(uint32(len(deleted)))
 		deletedDefs = append(deletedDefs, deleted...)
 	}
+
+	statMetricsActive.Set(len(m.defById))
 	statDeleteDuration.Value(time.Since(pre))
 
 	return deletedDefs, nil
@@ -1135,16 +1177,16 @@ func (m *MemoryIdx) delete(orgId uint32, n *Node, deleteEmptyParents, deleteChil
 	tree := m.tree[orgId]
 	deletedDefs := make([]idx.Archive, 0)
 	if deleteChildren && n.HasChildren() {
-		log.Debug("memory-idx: deleting branch %s", n.Path)
+		log.Debugf("memory-idx: deleting branch %s", n.Path)
 		// walk up the tree to find all leaf nodes and delete them.
 		for _, child := range n.Children {
 			node, ok := tree.Items[n.Path+"."+child]
 			if !ok {
 				corruptIndex.Inc()
-				log.Error(3, "memory-idx: node %q missing. Index is corrupt.", n.Path+"."+child)
+				log.Errorf("memory-idx: node %q missing. Index is corrupt.", n.Path+"."+child)
 				continue
 			}
-			log.Debug("memory-idx: deleting child %s from branch %s", node.Path, n.Path)
+			log.Debugf("memory-idx: deleting child %s from branch %s", node.Path, n.Path)
 			deleted := m.delete(orgId, node, false, true)
 			deletedDefs = append(deletedDefs, deleted...)
 		}
@@ -1153,7 +1195,7 @@ func (m *MemoryIdx) delete(orgId uint32, n *Node, deleteEmptyParents, deleteChil
 
 	// delete the metricDefs
 	for _, id := range n.Defs {
-		log.Debug("memory-idx: deleting %s from index", id)
+		log.Debugf("memory-idx: deleting %s from index", id)
 		deletedDefs = append(deletedDefs, *m.defById[id])
 		delete(m.defById, id)
 	}
@@ -1179,11 +1221,11 @@ func (m *MemoryIdx) delete(orgId uint32, n *Node, deleteEmptyParents, deleteChil
 	nodes := strings.Split(n.Path, ".")
 	for i := len(nodes) - 1; i >= 0; i-- {
 		branch := strings.Join(nodes[:i], ".")
-		log.Debug("memory-idx: removing %s from branch %s", nodes[i], branch)
+		log.Debugf("memory-idx: removing %s from branch %s", nodes[i], branch)
 		bNode, ok := tree.Items[branch]
 		if !ok {
 			corruptIndex.Inc()
-			log.Error(3, "memory-idx: node %s missing. Index is corrupt.", branch)
+			log.Errorf("memory-idx: node %s missing. Index is corrupt.", branch)
 			continue
 		}
 		if len(bNode.Children) > 1 {
@@ -1192,11 +1234,11 @@ func (m *MemoryIdx) delete(orgId uint32, n *Node, deleteEmptyParents, deleteChil
 				if child != nodes[i] {
 					newChildren = append(newChildren, child)
 				} else {
-					log.Debug("memory-idx: %s removed from children list of branch %s", child, bNode.Path)
+					log.Debugf("memory-idx: %s removed from children list of branch %s", child, bNode.Path)
 				}
 			}
 			bNode.Children = newChildren
-			log.Debug("memory-idx: branch %s has other children. Leaving it in place", bNode.Path)
+			log.Debugf("memory-idx: branch %s has other children. Leaving it in place", bNode.Path)
 			// no need to delete any parents as they are needed by this node and its
 			// remaining children
 			break
@@ -1204,32 +1246,31 @@ func (m *MemoryIdx) delete(orgId uint32, n *Node, deleteEmptyParents, deleteChil
 
 		if len(bNode.Children) == 0 {
 			corruptIndex.Inc()
-			log.Error(3, "memory-idx: branch %s has no children while trying to delete %s. Index is corrupt", branch, nodes[i])
+			log.Errorf("memory-idx: branch %s has no children while trying to delete %s. Index is corrupt", branch, nodes[i])
 			break
 		}
 
 		if bNode.Children[0] != nodes[i] {
 			corruptIndex.Inc()
-			log.Error(3, "memory-idx: %s not in children list for branch %s. Index is corrupt", nodes[i], branch)
+			log.Errorf("memory-idx: %s not in children list for branch %s. Index is corrupt", nodes[i], branch)
 			break
 		}
 		bNode.Children = nil
 		if bNode.Leaf() {
-			log.Debug("memory-idx: branch %s is also a leaf node, keeping it.", branch)
+			log.Debugf("memory-idx: branch %s is also a leaf node, keeping it.", branch)
 			break
 		}
-		log.Debug("memory-idx: branch %s has no children and is not a leaf node, deleting it.", branch)
+		log.Debugf("memory-idx: branch %s has no children and is not a leaf node, deleting it.", branch)
 		delete(tree.Items, branch)
 	}
 
 	return deletedDefs
 }
 
-// delete series from the index if they have not been seen since "oldest"
-func (m *MemoryIdx) Prune(oldest time.Time) ([]idx.Archive, error) {
-	oldestUnix := oldest.Unix()
+// Prune prunes series from the index if they have become stale per their index-rule
+func (m *MemoryIdx) Prune(now time.Time) ([]idx.Archive, error) {
+	log.Info("memory-idx: start pruning of series across all orgs")
 	orgs := make(map[uint32]struct{})
-	log.Info("memory-idx: pruning stale metricDefs across all orgs")
 	m.RLock()
 	for org := range m.tree {
 		orgs[org] = struct{}{}
@@ -1250,10 +1291,15 @@ func (m *MemoryIdx) Prune(oldest time.Time) ([]idx.Archive, error) {
 	}
 	pre := time.Now()
 
+	// getting all cutoffs once saves having to recompute everytime we have a match
+	cutoffs := IndexRules.Cutoffs(now)
+
 	m.RLock()
+
 DEFS:
 	for _, def := range m.defById {
-		if def.LastUpdate >= oldestUnix {
+		cutoff := cutoffs[def.IrId]
+		if atomic.LoadInt64(&def.LastUpdate) >= cutoff {
 			continue DEFS
 		}
 
@@ -1269,7 +1315,7 @@ DEFS:
 			}
 
 			for _, id := range n.Defs {
-				if m.defById[id].LastUpdate >= oldestUnix {
+				if atomic.LoadInt64(&m.defById[id].LastUpdate) >= cutoff {
 					continue DEFS
 				}
 			}
@@ -1280,7 +1326,7 @@ DEFS:
 			// if any other MetricDef with the same tag set is not expired yet,
 			// then we do not want to prune any of them
 			for def := range defs {
-				if def.LastUpdate >= oldestUnix {
+				if atomic.LoadInt64(&def.LastUpdate) >= cutoff {
 					continue DEFS
 				}
 			}
@@ -1292,48 +1338,66 @@ DEFS:
 	}
 	m.RUnlock()
 
+	// create a new timeLimiter that allows us to limit the amount of time we spend
+	// holding a lock to maxPruneLockTime (default 100ms) every second.
+	tl := NewTimeLimiter(time.Second, maxPruneLockTime, time.Now())
+
 	for org, ids := range toPruneTagged {
 		if len(ids) == 0 {
 			continue
 		}
+		// make sure we are not locking for too long.
+		tl.Wait()
+		lockStart := time.Now()
 		m.Lock()
 		defs := m.deleteTaggedByIdSet(org, ids)
 		m.Unlock()
+		tl.Add(time.Since(lockStart))
 		pruned = append(pruned, defs...)
 	}
 
+ORGS:
 	for org, paths := range toPruneUntagged {
 		if len(paths) == 0 {
 			continue
 		}
 
-		m.Lock()
-		tree, ok := m.tree[org]
-		if !ok {
-			m.Unlock()
-			continue
-		}
-
 		for path := range paths {
-			n, ok := tree.Items[path]
+			tl.Wait()
+			lockStart := time.Now()
+			m.Lock()
+			tree, ok := m.tree[org]
+
 			if !ok {
 				m.Unlock()
-				log.Debug("memory-idx: series %s for orgId:%d was identified for pruning but cannot be found.", path, org)
+				tl.Add(time.Since(lockStart))
+				continue ORGS
+			}
+
+			n, ok := tree.Items[path]
+
+			if !ok {
+				m.Unlock()
+				tl.Add(time.Since(lockStart))
+				log.Debugf("memory-idx: series %s for orgId:%d was identified for pruning but cannot be found.", path, org)
 				continue
 			}
 
-			log.Debug("memory-idx: series %s for orgId:%d is stale. pruning it.", n.Path, org)
+			log.Debugf("memory-idx: series %s for orgId:%d is stale. pruning it.", n.Path, org)
 			defs := m.delete(org, n, true, false)
+			m.Unlock()
+			tl.Add(time.Since(lockStart))
 			pruned = append(pruned, defs...)
+
 		}
-		m.Unlock()
 	}
 
-	statMetricsActive.Add(-1 * len(pruned))
+	statMetricsActive.Set(len(m.defById))
 
-	log.Info("memory-idx: pruning stale metricDefs from memory for all orgs took %s", time.Since(pre).String())
+	duration := time.Since(pre)
+	log.Infof("memory-idx: finished pruning of %d series in %s", len(pruned), duration)
 
-	statPruneDuration.Value(time.Since(pre))
+	statPruneDuration.Value(duration)
 	return pruned, nil
 }
 
@@ -1359,7 +1423,7 @@ func getMatcher(path string) (func([]string) []string, error) {
 		for _, p := range patterns {
 			r, err := regexp.Compile(toRegexp(p))
 			if err != nil {
-				log.Debug("memory-idx: regexp failed to compile. %s - %s", p, err)
+				log.Debugf("memory-idx: regexp failed to compile. %s - %s", p, err)
 				return nil, errors.NewBadRequest(err.Error())
 			}
 			regexes = append(regexes, r)
@@ -1370,7 +1434,7 @@ func getMatcher(path string) (func([]string) []string, error) {
 			for _, r := range regexes {
 				for _, c := range children {
 					if r.MatchString(c) {
-						log.Debug("memory-idx: %s =~ %s", c, r.String())
+						log.Debugf("memory-idx: %s =~ %s", c, r.String())
 						matches = append(matches, c)
 					}
 				}
@@ -1385,7 +1449,7 @@ func getMatcher(path string) (func([]string) []string, error) {
 		for _, p := range patterns {
 			for _, c := range children {
 				if c == p {
-					log.Debug("memory-idx: %s matches %s", c, p)
+					log.Debugf("memory-idx: %s matches %s", c, p)
 					results = append(results, c)
 					break
 				}

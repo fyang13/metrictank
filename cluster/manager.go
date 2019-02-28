@@ -10,7 +10,7 @@ import (
 
 	"github.com/grafana/metrictank/stats"
 	"github.com/hashicorp/memberlist"
-	"github.com/raintank/worldping-api/pkg/log"
+	log "github.com/sirupsen/logrus"
 )
 
 var (
@@ -65,7 +65,7 @@ type ClusterManager interface {
 
 type MemberlistManager struct {
 	sync.RWMutex
-	members  map[string]HTTPNode // all members in the cluster, including this node.
+	members  map[string]HTTPNode // all members in the cluster, guaranteed to always have this node
 	nodeName string
 	list     *memberlist.Memberlist
 	cfg      *memberlist.Config
@@ -83,7 +83,12 @@ func NewMemberlistManager(thisNode HTTPNode) *MemberlistManager {
 		mgr.cfg = memberlist.DefaultLANConfig() // use this as base so that the other settings have proper defaults
 		mgr.cfg.BindPort = swimBindAddr.Port
 		mgr.cfg.BindAddr = swimBindAddr.IP.String()
-		mgr.cfg.AdvertisePort = swimBindAddr.Port
+		if swimAdvertiseAddr == nil {
+			mgr.cfg.AdvertisePort = swimBindAddr.Port
+		} else {
+			mgr.cfg.AdvertisePort = swimAdvertiseAddr.Port
+			mgr.cfg.AdvertiseAddr = swimAdvertiseAddr.IP.String()
+		}
 		mgr.cfg.TCPTimeout = swimTCPTimeout
 		mgr.cfg.IndirectChecks = swimIndirectChecks
 		mgr.cfg.RetransmitMult = swimRetransmitMult
@@ -106,7 +111,7 @@ func NewMemberlistManager(thisNode HTTPNode) *MemberlistManager {
 	case "default-wan":
 		mgr.cfg = memberlist.DefaultWANConfig()
 	default:
-		panic("invalid swimUseConfig. should already have been validated")
+		log.Panic("invalid swimUseConfig. should already have been validated")
 	}
 	mgr.cfg.Events = mgr
 	mgr.cfg.Delegate = mgr
@@ -118,10 +123,10 @@ func NewMemberlistManager(thisNode HTTPNode) *MemberlistManager {
 }
 
 func (c *MemberlistManager) Start() {
-	log.Info("CLU Start: Starting cluster on %s:%d", c.cfg.BindAddr, c.cfg.BindPort)
+	log.Infof("CLU Start: Starting cluster on %s:%d", c.cfg.BindAddr, c.cfg.BindPort)
 	list, err := memberlist.Create(c.cfg)
 	if err != nil {
-		log.Fatal(4, "CLU Start: Failed to create memberlist: %s", err.Error())
+		log.Fatalf("CLU Start: Failed to create memberlist: %s", err.Error())
 	}
 	c.setList(list)
 
@@ -130,9 +135,9 @@ func (c *MemberlistManager) Start() {
 	}
 	n, err := list.Join(strings.Split(peersStr, ","))
 	if err != nil {
-		log.Fatal(4, "CLU Start: Failed to join cluster: %s", err.Error())
+		log.Fatalf("CLU Start: Failed to join cluster: %s", err.Error())
 	}
-	log.Info("CLU Start: joined to %d nodes in cluster", n)
+	log.Infof("CLU Start: joined to %d nodes in cluster", n)
 }
 
 func (c *MemberlistManager) setList(list *memberlist.Memberlist) {
@@ -214,27 +219,40 @@ func (c *MemberlistManager) NotifyJoin(node *memberlist.Node) {
 	if len(node.Meta) == 0 {
 		return
 	}
-	log.Info("CLU manager: HTTPNode %s with address %s has joined the cluster", node.Name, node.Addr.String())
+	log.Infof("CLU manager: HTTPNode %s with address %s has joined the cluster", node.Name, node.Addr.String())
 	member := HTTPNode{}
 	err := json.Unmarshal(node.Meta, &member)
 	if err != nil {
-		log.Error(3, "CLU manager: Failed to decode node meta from %s: %s", node.Name, err.Error())
+		log.Errorf("CLU manager: Failed to decode node meta from %s: %s", node.Name, err.Error())
 		unmarshalErrJoin.Inc()
 		return
 	}
+
 	member.RemoteAddr = node.Addr.String()
-	if member.Name == c.nodeName {
-		member.local = true
+	member.local = (member.Name == c.nodeName)
+
+	// we never want anyone else in the cluster to tell us anything about ourselves
+	// cause we know ourself best.
+	if member.local {
+		return
+	}
+
+	existing, ok := c.members[node.Name]
+	if ok && !member.Updated.After(existing.Updated) {
+		return
 	}
 	c.members[node.Name] = member
 	c.clusterStats()
 }
 
 func (c *MemberlistManager) NotifyLeave(node *memberlist.Node) {
+	if node.Name == c.nodeName {
+		return
+	}
 	eventsLeave.Inc()
 	c.Lock()
 	defer c.Unlock()
-	log.Info("CLU manager: HTTPNode %s has left the cluster", node.Name)
+	log.Infof("CLU manager: HTTPNode %s has left the cluster", node.Name)
 	delete(c.members, node.Name)
 	c.clusterStats()
 }
@@ -249,10 +267,11 @@ func (c *MemberlistManager) NotifyUpdate(node *memberlist.Node) {
 	member := HTTPNode{}
 	err := json.Unmarshal(node.Meta, &member)
 	if err != nil {
-		log.Error(3, "CLU manager: Failed to decode node meta from %s: %s", node.Name, err.Error())
+		log.Errorf("CLU manager: Failed to decode node meta from %s: %s", node.Name, err.Error())
 		unmarshalErrUpdate.Inc()
-		// if the node is known, lets mark it as notReady until it starts sending valid data again.
-		if p, ok := c.members[node.Name]; ok {
+		// if the node is known and it is not thisNode,
+		// lets mark it as notReady until it starts sending valid data again.
+		if p, ok := c.members[node.Name]; ok && node.Name != c.nodeName {
 			p.State = NodeNotReady
 			p.StateChange = time.Now()
 			// we dont set Updated as we dont want the NotReady state to propagate incase we are the only node
@@ -261,12 +280,22 @@ func (c *MemberlistManager) NotifyUpdate(node *memberlist.Node) {
 		}
 		return
 	}
+
 	member.RemoteAddr = node.Addr.String()
-	if member.Name == c.nodeName {
-		member.local = true
+	member.local = (member.Name == c.nodeName)
+
+	// we never want anyone else in the cluster to tell us anything about ourselves
+	// cause we know ourself best.
+	if member.local {
+		return
+	}
+
+	existing, ok := c.members[node.Name]
+	if ok && !member.Updated.After(existing.Updated) {
+		return
 	}
 	c.members[node.Name] = member
-	log.Info("CLU manager: HTTPNode %s at %s has been updated - %s", node.Name, node.Addr.String(), node.Meta)
+	log.Infof("CLU manager: HTTPNode %s at %s has been updated - %s", node.Name, node.Addr.String(), node.Meta)
 	c.clusterStats()
 }
 
@@ -286,7 +315,7 @@ func (c *MemberlistManager) NodeMeta(limit int) []byte {
 	meta, err := json.Marshal(c.members[c.nodeName])
 	c.RUnlock()
 	if err != nil {
-		log.Fatal(4, "CLU manager: %s", err.Error())
+		log.Fatalf("CLU manager: %s", err.Error())
 	}
 	return meta
 }
@@ -341,13 +370,11 @@ func (c *MemberlistManager) SetReady() {
 // Set the state of this node.
 func (c *MemberlistManager) SetState(state NodeState) {
 	c.Lock()
-	if c.members[c.nodeName].State == state {
+	node := c.members[c.nodeName]
+	if !node.SetState(state) {
 		c.Unlock()
 		return
 	}
-	node := c.members[c.nodeName]
-	node.State = state
-	node.Updated = time.Now()
 	c.members[c.nodeName] = node
 	c.Unlock()
 	nodeReady.Set(state == NodeReady)
@@ -362,19 +389,16 @@ func (c *MemberlistManager) IsPrimary() bool {
 }
 
 // SetPrimary sets the primary status of this node
-func (c *MemberlistManager) SetPrimary(p bool) {
+func (c *MemberlistManager) SetPrimary(primary bool) {
 	c.Lock()
-	if c.members[c.nodeName].Primary == p {
+	node := c.members[c.nodeName]
+	if !node.SetPrimary(primary) {
 		c.Unlock()
 		return
 	}
-	node := c.members[c.nodeName]
-	node.Primary = p
-	node.PrimaryChange = time.Now()
-	node.Updated = time.Now()
 	c.members[c.nodeName] = node
 	c.Unlock()
-	nodePrimary.Set(p)
+	nodePrimary.Set(primary)
 	c.BroadcastUpdate()
 }
 
@@ -383,8 +407,7 @@ func (c *MemberlistManager) SetPartitions(part []int32) {
 	sort.Slice(part, func(i, j int) bool { return part[i] < part[j] })
 	c.Lock()
 	node := c.members[c.nodeName]
-	node.Partitions = part
-	node.Updated = time.Now()
+	node.SetPartitions(part)
 	c.members[c.nodeName] = node
 	c.Unlock()
 	nodePartitions.Set(len(part))
@@ -402,13 +425,11 @@ func (c *MemberlistManager) GetPartitions() []int32 {
 // lower values == higher priority
 func (c *MemberlistManager) SetPriority(prio int) {
 	c.Lock()
-	if c.members[c.nodeName].Priority == prio {
+	node := c.members[c.nodeName]
+	if !node.SetPriority(prio) {
 		c.Unlock()
 		return
 	}
-	node := c.members[c.nodeName]
-	node.Priority = prio
-	node.Updated = time.Now()
 	c.members[c.nodeName] = node
 	c.Unlock()
 	nodePriority.Set(prio)
@@ -442,13 +463,8 @@ func (m *SingleNodeManager) IsPrimary() bool {
 
 func (m *SingleNodeManager) SetPrimary(primary bool) {
 	m.Lock()
-	defer m.Unlock()
-	if m.node.Primary == primary {
-		return
-	}
-	m.node.Primary = primary
-	m.node.PrimaryChange = time.Now()
-	m.node.Updated = time.Now()
+	m.node.SetPrimary(primary)
+	m.Unlock()
 	nodePrimary.Set(primary)
 }
 
@@ -464,12 +480,8 @@ func (m *SingleNodeManager) SetReady() {
 
 func (m *SingleNodeManager) SetState(state NodeState) {
 	m.Lock()
-	defer m.Unlock()
-	if m.node.State == state {
-		return
-	}
-	m.node.State = state
-	m.node.Updated = time.Now()
+	m.node.SetState(state)
+	m.Unlock()
 	nodeReady.Set(state == NodeReady)
 }
 
@@ -498,9 +510,8 @@ func (m *SingleNodeManager) Join(peers []string) (int, error) {
 func (m *SingleNodeManager) SetPartitions(part []int32) {
 	sort.Slice(part, func(i, j int) bool { return part[i] < part[j] })
 	m.Lock()
-	defer m.Unlock()
-	m.node.Partitions = part
-	m.node.Updated = time.Now()
+	m.node.SetPartitions(part)
+	m.Unlock()
 	nodePartitions.Set(len(part))
 }
 
@@ -515,12 +526,8 @@ func (m *SingleNodeManager) GetPartitions() []int32 {
 // lower values == higher priority
 func (m *SingleNodeManager) SetPriority(prio int) {
 	m.Lock()
-	defer m.Unlock()
-	if m.node.Priority == prio {
-		return
-	}
-	m.node.Priority = prio
-	m.node.Updated = time.Now()
+	m.node.SetPriority(prio)
+	m.Unlock()
 	nodePriority.Set(prio)
 }
 

@@ -16,7 +16,7 @@ import (
 	"github.com/grafana/metrictank/mdata"
 	"github.com/grafana/metrictank/mdata/cache"
 	"github.com/grafana/metrictank/test"
-	"gopkg.in/raintank/schema.v1"
+	"github.com/raintank/schema"
 )
 
 func newSrv(delSeries, delArchives int) (*Server, *cache.MockCache) {
@@ -24,7 +24,7 @@ func newSrv(delSeries, delArchives int) (*Server, *cache.MockCache) {
 	srv.RegisterRoutes()
 
 	mdata.SetSingleAgg(conf.Avg, conf.Min, conf.Max)
-	mdata.SetSingleSchema(conf.NewRetentionMT(10, 100, 600, 10, true))
+	mdata.SetSingleSchema(conf.NewRetentionMT(10, 100, 600, 10, 0))
 
 	store := mdata.NewMockStore()
 	store.Drop = true

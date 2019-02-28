@@ -7,8 +7,9 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/grafana/metrictank/api/models"
 	"github.com/grafana/metrictank/util"
-	"github.com/raintank/worldping-api/pkg/log"
+	log "github.com/sirupsen/logrus"
 )
 
 var (
@@ -392,9 +393,38 @@ func extractMetric(m string) string {
 	}
 
 	if quoteChar != 0 {
-		log.Warn("extractMetric: encountered unterminated string literal in %s", m)
+		log.Warnf("extractMetric: encountered unterminated string literal in %s", m)
 		return ""
 	}
 
 	return m[start:end]
+}
+
+// aggKey creates a key for a serie based on its target metric as well
+// as a list of nodes which need to be extracted
+// returns a single string
+func aggKey(serie models.Series, nodes []expr) string {
+	metric := extractMetric(serie.Target)
+	if len(metric) == 0 {
+		metric = serie.Tags["name"]
+	}
+	// Trim off tags (if they are there) and split on '.'
+	parts := strings.Split(strings.SplitN(metric, ";", 2)[0], ".")
+	var name []string
+	for _, n := range nodes {
+		if n.etype == etInt {
+			idx := int(n.int)
+			if idx < 0 {
+				idx += len(parts)
+			}
+			if idx >= len(parts) || idx < 0 {
+				continue
+			}
+			name = append(name, parts[idx])
+		} else if n.etype == etString {
+			s := n.str
+			name = append(name, serie.Tags[s])
+		}
+	}
+	return strings.Join(name, ".")
 }

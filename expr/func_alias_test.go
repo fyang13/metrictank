@@ -6,7 +6,7 @@ import (
 	"testing"
 
 	"github.com/grafana/metrictank/api/models"
-	"gopkg.in/raintank/schema.v1"
+	"github.com/raintank/schema"
 )
 
 func TestAliasSingle(t *testing.T) {
@@ -88,6 +88,9 @@ func testAlias(name string, in []models.Series, out []models.Series, t *testing.
 		g := got[i]
 		if o.Target != g.Target {
 			t.Fatalf("case %q: expected target %q, got %q", name, o.Target, g.Target)
+		}
+		if o.Target != g.Tags["name"] {
+			t.Fatalf("case %q: expected target to match name tag but target = %q, tag =  %q", name, o.Target, g.Tags["name"])
 		}
 		if len(o.Datapoints) != len(g.Datapoints) {
 			t.Fatalf("case %q: len output expected %d, got %d", name, len(o.Datapoints), len(g.Datapoints))

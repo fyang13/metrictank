@@ -15,8 +15,8 @@ POST /
 
 returns:
 
-* `200 OK` if the node is primary or a warmed up secondary (`warmupPeriod` has elapsed)
-* `503 Service not ready` if the node is secondary and not yet warmed up.
+* `200 OK` if the node is [ready](clustering.md#priority-and-ready-state)
+* `503 Service not ready` otherwise.
 
 #### Example
 
@@ -132,7 +132,7 @@ returns a json document with the following fields:
 * "primary": whether the node is a primary node or not
 * "primaryChange": timestamp of when the primary state last changed
 * "version": metrictank version
-* "state": whether the node is ready to handle requests or not
+* "state": whether the node is [ready](clustering.md#priority-and-ready-state) to handle requests or not
 * "stateChange": timestamp of when the state last changed
 * "started": timestamp of when the node started up
 
@@ -198,6 +198,25 @@ curl -s http://localhost:6060/priority | jsonpp
         }
     }
 ]
+
+## Cache delete
+
+```
+GET /ccache/delete
+POST /ccache/delete
+```
+
+* `X-Org-Id`: required
+* patterns: one or more query (glob) patterns. Use `**` to mean "all data" (full reset)
+* expr: tag expressions
+* propagate: whether to propagate to other cluster nodes. true/false
+
+Remove chunks from the cache for matching series, or wipe the entire cache
+
+#### Example
+
+```bash
+curl -v -X POST -d '{"propagate": true, "orgId": 1, "patterns": ["**"]}' -H 'Content-Type: application/json' http://localhost:6060/ccache/delete
 ```
 
 ## Misc

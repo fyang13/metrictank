@@ -1,18 +1,18 @@
 #!/bin/bash
+set -e
 # Find the directory we exist within
 DIR=$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )
 cd ${DIR}/../..
-
-VERSION=`git describe --abbrev=7`
-
-echo
-echo "### docker push grafana/metrictank:$VERSION"
-echo
-
-docker push grafana/metrictank:$VERSION || exit 2
+source scripts/version-tag.sh
 
 echo
-echo "### docker push grafana/metrictank:latest"
+echo "### docker push grafana/metrictank:$version"
 echo
 
-docker push grafana/metrictank:latest
+docker push grafana/metrictank:$version
+
+echo
+echo "### docker push grafana/metrictank:$tag"
+echo
+
+docker push grafana/metrictank:$tag

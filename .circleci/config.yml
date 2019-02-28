@@ -3,7 +3,7 @@ jobs:
   build:
     working_directory: /go/src/github.com/grafana/metrictank
     docker:
-      - image: circleci/golang:1.10
+      - image: circleci/golang:1.11.4
     steps:
       - checkout
       - run: scripts/build.sh
@@ -21,7 +21,7 @@ jobs:
   test:
     working_directory: /go/src/github.com/grafana/metrictank
     docker:
-      - image: circleci/golang:1.10
+      - image: circleci/golang:1.11.4
     steps:
       - checkout
       - run: go test -v -race $(go list ./... | grep -v github.com/grafana/metrictank/stacktest)
@@ -29,16 +29,17 @@ jobs:
   qa:
     working_directory: /go/src/github.com/grafana/metrictank
     docker:
-      - image: circleci/golang:1.10
+      - image: circleci/golang:1.11.4
     steps:
       - checkout
       - run: scripts/qa/gofmt.sh
-      - run: scripts/qa/go-generate.sh
+      - run: scripts/qa/go-generate.sh --force
       - run: scripts/qa/ineffassign.sh
       - run: scripts/qa/misspell.sh
       - run: scripts/qa/gitignore.sh
       - run: scripts/qa/unused.sh
       - run: scripts/qa/vendor.sh
+      - run: scripts/qa/vet-high-confidence.sh
 
   qa-post-build:
     working_directory: /home/circleci/.go_workspace/src/github.com/grafana/metrictank
@@ -50,6 +51,7 @@ jobs:
       - run: scripts/qa/docs.sh
       - run: docker load -i build_docker/metrictank.tar
       - run: go test -v ./stacktest/tests/end2end_carbon
+      - run: go test -v ./stacktest/tests/end2end_carbon_bigtable
 
   deploy:
     docker:

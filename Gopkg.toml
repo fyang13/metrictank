@@ -19,27 +19,31 @@
 #  name = "github.com/x/y"
 #  version = "2.4.0"
 
+[prune]
+go-tests = true
+non-go = true
+unused-packages = true
 
 [[constraint]]
   name = "github.com/Dieterbe/artisanalhistogram"
+  branch = "master"
 
 [[constraint]]
   name = "github.com/Dieterbe/profiletrigger"
+  branch = "master"
 
 [[constraint]]
   name = "github.com/Shopify/sarama"
-  version = "1.10.1"
+  version = "v1.19.0"
 
 [[constraint]]
-  name = "github.com/Sirupsen/logrus"
-  version = "0.7.3"
+  name = "github.com/sirupsen/logrus"
+  # carbon-relay-ng needs this version. and tsdbgw includes both metrictank and carbon-relay-ng
+  revision = "08e90462da344fbb3880e8e47a0ddacc37508579"
 
 [[constraint]]
-  branch = "master"
   name = "github.com/alyu/configparser"
-
-[[constraint]]
-  name = "github.com/bitly/go-hostpool"
+  branch = "master"
 
 [[constraint]]
   name = "github.com/davecgh/go-spew"
@@ -47,74 +51,67 @@
 
 [[constraint]]
   name = "github.com/dgryski/go-linlog"
-
-[[constraint]]
-  name = "github.com/dgryski/go-tsz"
+  branch = "master"
 
 [[constraint]]
   name = "github.com/docker/docker"
+  version = "v1.13.1"
 
 [[constraint]]
   name = "github.com/go-macaron/binding"
+  revision = "a453235199f8898e01647db8820f937a184fbd09"
 
 [[constraint]]
   name = "github.com/gocql/gocql"
   revision = "d9815cdf0ff24e2efa9b8062f4f94a6dd347ae51"
 
 [[constraint]]
-  branch = "master"
   name = "github.com/golang/snappy"
+  branch = "master"
 
 [[constraint]]
-  branch = "master"
   name = "github.com/hailocab/go-hostpool"
+  branch = "master"
 
 [[constraint]]
-  branch = "master"
   name = "github.com/hashicorp/memberlist"
+  branch = "master"
 
 [[constraint]]
   name = "github.com/kisielk/og-rek"
+  version = "v1.0.0"
 
 [[constraint]]
-  branch = "master"
   name = "github.com/kisielk/whisper-go"
+  branch = "master"
 
 [[constraint]]
-  branch = "master"
   name = "github.com/metrics20/go-metrics20"
-
-[[constraint]]
   branch = "master"
-  name = "github.com/mitchellh/go-homedir"
 
 [[constraint]]
-  name = "github.com/nsqio/go-nsq"
+  name = "github.com/mitchellh/go-homedir"
+  branch = "master"
 
 [[constraint]]
   name = "github.com/opentracing/opentracing-go"
+  version = "^1"
 
 [[constraint]]
-  branch = "v2"
   name = "github.com/raintank/dur"
+  branch = "master"
 
 [[constraint]]
-  branch = "master"
   name = "github.com/raintank/gziper"
+  branch = "master"
 
 [[constraint]]
-  branch = "master"
   name = "github.com/raintank/met"
-
-[[constraint]]
   branch = "master"
-  name = "github.com/raintank/misc"
 
 [[constraint]]
-  name = "github.com/raintank/worldping-api"
-
-[[constraint]]
-  name = "github.com/rakyll/globalconf"
+  name = "github.com/raintank/schema"
+  revision = "dc8d31b5117ed606334858ae45319b022d233806"
 
 [[constraint]]
   name = "github.com/rs/cors"
@@ -122,19 +119,19 @@
 
 [[constraint]]
   name = "github.com/sergi/go-diff"
+  version = "v1.0.0"
 
 [[constraint]]
   name = "github.com/smartystreets/goconvey"
-
-[[constraint]]
-  name = "github.com/syndtr/goleveldb"
+  branch = "master"
 
 [[constraint]]
   name = "github.com/tinylib/msgp"
-  version = "1.0.0-beta"
+  version = "v1.1.0"
 
 [[constraint]]
   name = "github.com/uber/jaeger-client-go"
+  version = "2.15.0"
   source = "https://github.com/jaegertracing/jaeger-client-go.git"
 
 [[override]]
@@ -146,11 +143,13 @@
   version = "1.1.8"
 
 [[constraint]]
-  name = "gopkg.in/raintank/schema.v1"
+  name = "github.com/prometheus/prometheus"
+  source = "https://github.com/Dieterbe/prometheus.git"
+  branch = "v2.1.0-tom-fix-testing-flags"
 
 [[constraint]]
-  name = "github.com/prometheus/prometheus"
-  version = "2.1.0"
+  name = "github.com/prometheus/procfs"
+  revision = "75f2d6163c7a100bed6e971044ea3de30ee3a678"
 
 [[override]]
   name = "golang.org/x/net"

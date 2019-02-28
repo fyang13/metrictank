@@ -10,8 +10,9 @@ services:
     volumes:
       - ../../build/metrictank:/usr/bin/metrictank
       - ../../scripts/config/metrictank-docker.ini:/etc/metrictank/metrictank.ini
-      - ../../scripts/config/storage-schemas.conf:/etc/metrictank/storage-schemas.conf
+      - ../../scripts/config/index-rules.conf:/etc/metrictank/index-rules.conf
       - ../../scripts/config/storage-aggregation.conf:/etc/metrictank/storage-aggregation.conf
+      - ../../scripts/config/storage-schemas.conf:/etc/metrictank/storage-schemas.conf
       - ../../scripts/config/schema-store-scylladb.toml:/etc/metrictank/schema-store-cassandra.toml
       - ../../scripts/config/schema-idx-scylladb.toml:/etc/metrictank/schema-idx-cassandra.toml
 
@@ -45,6 +46,10 @@ services:
     image: grafana/grafana
     ports:
       - "3000:3000"
+    volumes:
+      - ./grafana-datasources:/etc/grafana/provisioning/datasources
+      - ../cfg/grafana-dashboards-main-extra:/etc/grafana/provisioning/dashboards
+      - ../../dashboards:/var/lib/grafana/dashboards
 
   statsdaemon:
     hostname: statsdaemon
@@ -52,4 +57,4 @@ services:
     ports:
      - "8125:8125/udp"
     volumes:
-     - "../statsdaemon.ini:/etc/statsdaemon.ini"
+     - "../cfg/statsdaemon.ini:/etc/statsdaemon.ini"

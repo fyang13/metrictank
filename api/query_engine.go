@@ -15,9 +15,9 @@ var (
 	// metric api.request.render.chosen_archive is the archive chosen for the request.
 	// 0 means original data, 1 means first agg level, 2 means 2nd
 	reqRenderChosenArchive = stats.NewMeter32("api.request.render.chosen_archive", false)
-	// metric api.request.render.series is the number of points that need to be fetched for a /render request.
+	// metric api.request.render.points_fetched is the number of points that need to be fetched for a /render request.
 	reqRenderPointsFetched = stats.NewMeter32("api.request.render.points_fetched", false)
-	// metric api.request.render.series is the number of points the request will return.
+	// metric api.request.render.points_returned is the number of points the request will return.
 	reqRenderPointsReturned = stats.NewMeter32("api.request.render.points_returned", false)
 
 	errUnSatisfiable   = response.NewError(404, "request cannot be satisfied due to lack of available retentions")
@@ -63,7 +63,7 @@ func alignRequests(now, from, to uint32, reqs []models.Req) ([]models.Req, uint3
 		retentions := mdata.Schemas.Get(req.SchemaId).Retentions
 		for i, ret := range retentions {
 			// skip non-ready option.
-			if !ret.Ready {
+			if ret.Ready > from {
 				continue
 			}
 			req.Archive = i
@@ -119,7 +119,7 @@ func alignRequests(now, from, to uint32, reqs []models.Req) ([]models.Req, uint3
 			retentions := mdata.Schemas.Get(req.SchemaId).Retentions
 			for i, ret := range retentions[req.Archive+1:] {
 				archInterval := uint32(ret.SecondsPerPoint)
-				if interval == archInterval && ret.Ready {
+				if interval == archInterval && ret.Ready <= from {
 					// we're in luck. this will be more efficient than runtime consolidation
 					req.Archive = req.Archive + 1 + i
 					req.ArchInterval = archInterval

@@ -7,18 +7,26 @@ import (
 	"runtime"
 	"time"
 
-	log "github.com/Sirupsen/logrus"
 	"github.com/grafana/metrictank/conf"
+	"github.com/grafana/metrictank/logger"
 	"github.com/grafana/metrictank/store/cassandra"
+	log "github.com/sirupsen/logrus"
 )
 
 var (
-	gitHash      = "(none)"
+	version      = "(none)"
 	showVersion  = flag.Bool("version", false, "print version string")
 	windowFactor = flag.Int("window-factor", 20, "size of compaction window relative to TTL")
 	metric       = flag.String("metric", "", "specify a metric name to see which schema it matches")
 	interval     = flag.Int("int", 0, "specify an interval to apply interval-based matching in addition to metric matching (e.g. to simulate kafka-mdm input)")
 )
+
+func init() {
+	formatter := &logger.TextFormatter{}
+	formatter.TimestampFormat = "2006-01-02 15:04:05.000"
+	log.SetFormatter(formatter)
+	log.SetLevel(log.InfoLevel)
+}
 
 func main() {
 	flag.Usage = func() {
@@ -35,7 +43,7 @@ func main() {
 	flag.Parse()
 
 	if *showVersion {
-		fmt.Printf("mt-schemas-explain (built with %s, git hash %s)\n", runtime.Version(), gitHash)
+		fmt.Printf("mt-schemas-explain (version: %s - runtime: %s)\n", version, runtime.Version())
 		return
 	}
 	if flag.NArg() > 1 {
@@ -80,7 +88,7 @@ func display(schema conf.Schema) {
 		}
 		chunkSpanStr := time.Duration(time.Duration(ret.ChunkSpan) * time.Second).String()
 		windowSizeStr := time.Duration(time.Duration(table.WindowSize) * time.Hour).String()
-		fmt.Printf("           %10d %10s %10s %10d %10t %15s %10s\n", ret.SecondsPerPoint, retStr, chunkSpanStr, ret.NumChunks, ret.Ready, table.Name, windowSizeStr)
+		fmt.Printf("           %10d %10s %10s %10d %12d %15s %10s\n", ret.SecondsPerPoint, retStr, chunkSpanStr, ret.NumChunks, ret.Ready, table.Name, windowSizeStr)
 	}
 	fmt.Println()
 }

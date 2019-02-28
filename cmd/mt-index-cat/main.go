@@ -3,21 +3,32 @@ package main
 import (
 	"flag"
 	"fmt"
-	"log"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/grafana/metrictank/cmd/mt-index-cat/out"
+	"github.com/grafana/metrictank/conf"
 	"github.com/grafana/metrictank/idx/cassandra"
+	"github.com/grafana/metrictank/idx/memory"
+	"github.com/grafana/metrictank/logger"
 	"github.com/raintank/dur"
-	"gopkg.in/raintank/schema.v1"
+	"github.com/raintank/schema"
+	log "github.com/sirupsen/logrus"
 )
+
+func init() {
+	formatter := &logger.TextFormatter{}
+	formatter.TimestampFormat = "2006-01-02 15:04:05.000"
+	log.SetFormatter(formatter)
+	log.SetLevel(log.InfoLevel)
+}
 
 func perror(err error) {
 	if err != nil {
-		log.Fatal(err)
+		log.Fatal(err.Error())
 	}
 }
 
@@ -26,19 +37,28 @@ func main() {
 	var addr string
 	var prefix string
 	var substr string
+	var suffix string
+	var regexStr string
+	var regex *regexp.Regexp
 	var tags string
 	var from string
-	var maxAge string
+	var maxStale string
+	var minStale string
 	var verbose bool
 	var limit int
+	var partitionStr string
 
 	globalFlags := flag.NewFlagSet("global config flags", flag.ExitOnError)
 	globalFlags.StringVar(&addr, "addr", "http://localhost:6060", "graphite/metrictank address")
 	globalFlags.StringVar(&prefix, "prefix", "", "only show metrics that have this prefix")
 	globalFlags.StringVar(&substr, "substr", "", "only show metrics that have this substring")
+	globalFlags.StringVar(&suffix, "suffix", "", "only show metrics that have this suffix")
+	globalFlags.StringVar(&partitionStr, "partitions", "*", "only show metrics from the comma separated list of partitions or * for all")
+	globalFlags.StringVar(&regexStr, "regex", "", "only show metrics that match this regex")
 	globalFlags.StringVar(&tags, "tags", "", "tag filter. empty (default), 'some', 'none', 'valid', or 'invalid'")
 	globalFlags.StringVar(&from, "from", "30min", "for vegeta outputs, will generate requests for data starting from now minus... eg '30min', '5h', '14d', etc. or a unix timestamp")
-	globalFlags.StringVar(&maxAge, "max-age", "6h30min", "max age (last update diff with now) of metricdefs.  use 0 to disable")
+	globalFlags.StringVar(&maxStale, "max-stale", "6h30min", "exclude series that have not been seen for this much time.  use 0 to disable")
+	globalFlags.StringVar(&minStale, "min-stale", "0", "exclude series that have been seen in this much time.  use 0 to disable")
 	globalFlags.IntVar(&limit, "limit", 0, "only show this many metrics.  use 0 to disable")
 	globalFlags.BoolVar(&verbose, "verbose", false, "print stats to stderr")
 
@@ -68,17 +88,26 @@ func main() {
 		fmt.Printf("cass config flags:\n\n")
 		cassFlags.PrintDefaults()
 		fmt.Println()
-		fmt.Printf("output: either presets like %v\n", strings.Join(outputs, "|"))
-		fmt.Printf("output: or custom templates like '{{.Id}} {{.OrgId}} {{.Name}} {{.Metric}} {{.Interval}} {{.Unit}} {{.Mtype}} {{.Tags}} {{.LastUpdate}} {{.Partition}}'\n\n\n")
-		fmt.Println("You may also use processing functions in templates:")
-		fmt.Println("pattern: transforms a graphite.style.metric.name into a pattern with wildcards inserted")
-		fmt.Println("age: subtracts the passed integer (typically .LastUpdate) from the query time")
-		fmt.Println("roundDuration: formats an integer-seconds duration using aggressive rounding. for the purpose of getting an idea of overal metrics age")
+		fmt.Println("output:")
+		fmt.Println()
+		fmt.Printf(" * presets: %v\n", strings.Join(outputs, "|"))
+		fmt.Println(" * templates, which may contain:")
+		fmt.Println("   - fields,  e.g. '{{.Id}} {{.OrgId}} {{.Name}} {{.Interval}} {{.Unit}} {{.Mtype}} {{.Tags}} {{.LastUpdate}} {{.Partition}}'")
+		fmt.Println("   - methods, e.g. '{{.NameWithTags}}' (works basically the same as a field)")
+		fmt.Println("   - processing functions:")
+		fmt.Println("     pattern:       transforms a graphite.style.metric.name into a pattern with wildcards inserted")
+		fmt.Println("                    an operation is randomly selected between: replacing a node with a wildcard, replacing a character with a wildcard, and passthrough")
+		out.PatternCustomUsage("     ")
+		fmt.Println("     age:           subtracts the passed integer (typically .LastUpdate) from the query time")
+		fmt.Println("     roundDuration: formats an integer-seconds duration using aggressive rounding. for the purpose of getting an idea of overal metrics age")
+		fmt.Println()
+		fmt.Println()
 		fmt.Println("EXAMPLES:")
 		fmt.Println("mt-index-cat -from 60min cass -hosts cassandra:9042 list")
 		fmt.Println("mt-index-cat -from 60min cass -hosts cassandra:9042 'sumSeries({{.Name | pattern}})'")
 		fmt.Println("mt-index-cat -from 60min cass -hosts cassandra:9042 'GET http://localhost:6060/render?target=sumSeries({{.Name | pattern}})&from=-6h\\nX-Org-Id: 1\\n\\n'")
 		fmt.Println("mt-index-cat cass -hosts cassandra:9042 -timeout 60s '{{.LastUpdate | age | roundDuration}}\\n' | sort | uniq -c")
+		fmt.Println("mt-index-cat cass -hosts localhost:9042 -schema-file ../../scripts/config/schema-idx-cassandra.toml '{{.Name | patternCustom 15 \"pass\" 40 \"1rcnw\" 15 \"2rcnw\" 10 \"3rcnw\" 10 \"3rccw\" 10 \"2rccw\"}}\\n'")
 	}
 
 	if len(os.Args) == 2 && (os.Args[1] == "-h" || os.Args[1] == "--help") {
@@ -103,6 +132,7 @@ func main() {
 			}
 		}
 	}
+
 	if !found {
 		log.Printf("invalid output %q", format)
 		flag.Usage()
@@ -128,7 +158,16 @@ func main() {
 
 	globalFlags.Parse(os.Args[1:cassI])
 	cassFlags.Parse(os.Args[cassI+1 : len(os.Args)-1])
-	cassandra.Enabled = true
+	cassandra.CliConfig.Enabled = true
+
+	if regexStr != "" {
+		var err error
+		regex, err = regexp.Compile(regexStr)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(2)
+		}
+	}
 
 	var show func(d schema.MetricDefinition)
 
@@ -145,7 +184,7 @@ func main() {
 		show = out.Template(format)
 	}
 
-	idx := cassandra.New()
+	idx := cassandra.New(cassandra.CliConfig)
 	err := idx.InitBare()
 	perror(err)
 
@@ -156,15 +195,55 @@ func main() {
 		perror(err)
 	}
 
-	var cutoff uint32
-	if maxAge != "0" {
-		maxAgeInt, err := dur.ParseNDuration(maxAge)
-		perror(err)
-		cutoff = uint32(time.Now().Unix() - int64(maxAgeInt))
+	memory.IndexRules = conf.IndexRules{
+		Rules: nil,
+		Default: conf.IndexRule{
+			Name:     "default",
+			Pattern:  regexp.MustCompile(""),
+			MaxStale: 0,
+		},
 	}
 
-	defs := idx.Load(nil, cutoff)
-	// set this after doing the query, to assure age can't possibly be negative
+	if maxStale != "0" {
+		maxStaleInt, err := dur.ParseNDuration(maxStale)
+		perror(err)
+		memory.IndexRules.Default.MaxStale = time.Duration(maxStaleInt) * time.Second
+	}
+
+	var cutoffMin int64
+	if minStale != "0" {
+		minStaleInt, err := dur.ParseNDuration(minStale)
+		perror(err)
+		cutoffMin = time.Now().Unix() - int64(minStaleInt)
+	}
+
+	var partitions []int32
+	if partitionStr != "*" {
+		for _, p := range strings.Split(partitionStr, ",") {
+			p = strings.TrimSpace(p)
+
+			// handle trailing "," on the list of partitions.
+			if p == "" {
+				continue
+			}
+
+			id, err := strconv.ParseInt(p, 10, 32)
+			if err != nil {
+				log.Printf("invalid partition id %q. must be a int32", p)
+				flag.Usage()
+				os.Exit(-1)
+			}
+			partitions = append(partitions, int32(id))
+		}
+	}
+
+	var defs []schema.MetricDefinition
+	if len(partitions) == 0 {
+		defs = idx.Load(nil, time.Now())
+	} else {
+		defs = idx.LoadPartitions(partitions, nil, time.Now())
+	}
+	// set this after doing the query, to assure age can't possibly be negative unless if clocks are misconfigured.
 	out.QueryTime = time.Now().Unix()
 	total := len(defs)
 	shown := 0
@@ -173,6 +252,9 @@ func main() {
 		// note that prefix and substr can be "", meaning filter disabled.
 		// the conditions handle this fine as well.
 		if !strings.HasPrefix(d.Name, prefix) {
+			continue
+		}
+		if !strings.HasSuffix(d.Name, suffix) {
 			continue
 		}
 		if !strings.Contains(d.Name, substr) {
@@ -184,6 +266,9 @@ func main() {
 		if tags == "some" && len(d.Tags) == 0 {
 			continue
 		}
+		if regex != nil && !regex.MatchString(d.Name) {
+			continue
+		}
 		if tags == "valid" || tags == "invalid" {
 			valid := schema.ValidateTags(d.Tags)
 
@@ -191,6 +276,9 @@ func main() {
 			if valid != (tags == "valid") {
 				continue
 			}
+		}
+		if cutoffMin != 0 && d.LastUpdate >= cutoffMin {
+			continue
 		}
 		show(d)
 		shown += 1

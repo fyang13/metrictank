@@ -9,10 +9,10 @@ import (
 	"sync"
 	"sync/atomic"
 
-	schema "gopkg.in/raintank/schema.v1"
+	"github.com/raintank/schema"
 
 	"github.com/grafana/metrictank/idx"
-	"github.com/raintank/worldping-api/pkg/log"
+	log "github.com/sirupsen/logrus"
 )
 
 var (
@@ -626,7 +626,7 @@ func (q *TagQuery) testByTagMatch(def *idx.Archive) bool {
 		equal := strings.Index(tag, "=")
 		if equal < 0 {
 			corruptIndex.Inc()
-			log.Error(3, "memory-idx: ID %q has tag %q in index without '=' sign", def.Id, tag)
+			log.Errorf("memory-idx: ID %q has tag %q in index without '=' sign", def.Id, tag)
 			continue
 		}
 		key := tag[:equal]
@@ -657,7 +657,7 @@ func (q *TagQuery) testByTagMatch(def *idx.Archive) bool {
 
 // testByFrom filters a given metric by its LastUpdate time
 func (q *TagQuery) testByFrom(def *idx.Archive) bool {
-	return q.from <= def.LastUpdate
+	return q.from <= atomic.LoadInt64(&def.LastUpdate)
 }
 
 // testByPrefix filters a given metric by matching prefixes against the values
@@ -733,7 +733,7 @@ func (q *TagQuery) filterIdsFromChan(idCh, resCh chan schema.MKey) {
 			// should never happen because every ID in the tag index
 			// must be present in the byId lookup table
 			corruptIndex.Inc()
-			log.Error(3, "memory-idx: ID %q is in tag index but not in the byId lookup table", id)
+			log.Errorf("memory-idx: ID %q is in tag index but not in the byId lookup table", id)
 			continue
 		}
 
@@ -852,7 +852,7 @@ IDS:
 			// should never happen because every ID in the tag index
 			// must be present in the byId lookup table
 			corruptIndex.Inc()
-			log.Error(3, "memory-idx: ID %q is in tag index but not in the byId lookup table", id)
+			log.Errorf("memory-idx: ID %q is in tag index but not in the byId lookup table", id)
 			continue
 		}
 
@@ -863,7 +863,7 @@ IDS:
 			equal := strings.Index(tag, "=")
 			if equal < 0 {
 				corruptIndex.Inc()
-				log.Error(3, "memory-idx: ID %q has tag %q in index without '=' sign", id, tag)
+				log.Errorf("memory-idx: ID %q has tag %q in index without '=' sign", id, tag)
 				continue
 			}
 

@@ -1,7 +1,8 @@
 package end2end_carbon
 
 import (
-	"log"
+	"flag"
+	"fmt"
 	"os"
 	"os/exec"
 	"syscall"
@@ -9,11 +10,13 @@ import (
 	"time"
 
 	"github.com/davecgh/go-spew/spew"
+	"github.com/grafana/metrictank/logger"
 	"github.com/grafana/metrictank/stacktest/docker"
 	"github.com/grafana/metrictank/stacktest/fakemetrics"
 	"github.com/grafana/metrictank/stacktest/grafana"
 	"github.com/grafana/metrictank/stacktest/graphite"
 	"github.com/grafana/metrictank/stacktest/track"
+	log "github.com/sirupsen/logrus"
 )
 
 // TODO: cleanup when ctrl-C go test (teardown all containers)
@@ -23,19 +26,40 @@ var fm *fakemetrics.FakeMetrics
 
 const metricsPerSecond = 1000
 
+func init() {
+	formatter := &logger.TextFormatter{}
+	formatter.TimestampFormat = "2006-01-02 15:04:05.000"
+	log.SetFormatter(formatter)
+	log.SetLevel(log.InfoLevel)
+}
 func TestMain(m *testing.M) {
+	flag.Parse()
+	if testing.Short() {
+		fmt.Println("skipping end2end carbon test (cassandra) in short mode")
+		return
+	}
 	log.Println("launching docker-dev stack...")
-	cmd := exec.Command(docker.Path("docker/launch.sh"), "docker-dev")
-	var err error
+	version := exec.Command("docker-compose", "version")
+	output, err := version.CombinedOutput()
+	if err != nil {
+		log.Fatal(err.Error())
+	}
+	log.Println(string(output))
+
+	// TODO: should probably use -V flag here.
+	// introduced here https://github.com/docker/compose/releases/tag/1.19.0
+	// but circleCI machine image still stuck with 1.14.0
+	cmd := exec.Command("docker-compose", "up", "--force-recreate")
+	cmd.Dir = docker.Path("docker/docker-dev")
 
 	tracker, err = track.NewTracker(cmd, false, false, "launch-stdout", "launch-stderr")
 	if err != nil {
-		log.Fatal(err)
+		log.Fatal(err.Error())
 	}
 
 	err = cmd.Start()
 	if err != nil {
-		log.Fatal(err)
+		log.Fatal(err.Error())
 	}
 
 	retcode := m.Run()
@@ -69,7 +93,7 @@ func TestStartup(t *testing.T) {
 	case <-tracker.Match(matchers):
 		log.Println("stack now running.")
 		log.Println("Go to http://localhost:3000 (and login as admin:admin) to see what's going on")
-	case <-time.After(time.Second * 70):
+	case <-time.After(time.Second * 100):
 		grafana.PostAnnotation("TestStartup:FAIL")
 		t.Fatal("timed out while waiting for all metrictank instances to come up")
 	}

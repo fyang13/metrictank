@@ -4,14 +4,15 @@ package input
 
 import (
 	"fmt"
+	"math"
 
-	"gopkg.in/raintank/schema.v1"
-	"gopkg.in/raintank/schema.v1/msg"
+	"github.com/raintank/schema"
+	"github.com/raintank/schema/msg"
 
 	"github.com/grafana/metrictank/idx"
 	"github.com/grafana/metrictank/mdata"
 	"github.com/grafana/metrictank/stats"
-	"github.com/raintank/worldping-api/pkg/log"
+	log "github.com/sirupsen/logrus"
 )
 
 type Handler interface {
@@ -36,12 +37,18 @@ type DefaultHandler struct {
 
 func NewDefaultHandler(metrics mdata.Metrics, metricIndex idx.MetricIndex, input string) DefaultHandler {
 	return DefaultHandler{
-		receivedMD:   stats.NewCounter32(fmt.Sprintf("input.%s.metricdata.received", input)),
-		receivedMP:   stats.NewCounter32(fmt.Sprintf("input.%s.metricpoint.received", input)),
+		// metric input.%s.metricdata.received is the count of metricdata datapoints received by input plugin
+		receivedMD: stats.NewCounter32(fmt.Sprintf("input.%s.metricdata.received", input)),
+		// metric input.%s.metricpoint.received is the count of metricpoint datapoints received by input plugin
+		receivedMP: stats.NewCounter32(fmt.Sprintf("input.%s.metricpoint.received", input)),
+		// metric input.%s.metricpoint_no_org.received is the count of metricpoint_no_org datapoints received by input plugin
 		receivedMPNO: stats.NewCounter32(fmt.Sprintf("input.%s.metricpoint_no_org.received", input)),
-		invalidMD:    stats.NewCounterRate32(fmt.Sprintf("input.%s.metricdata.invalid", input)),
-		invalidMP:    stats.NewCounterRate32(fmt.Sprintf("input.%s.metricpoint.invalid", input)),
-		unknownMP:    stats.NewCounter32(fmt.Sprintf("input.%s.metricpoint.unknown", input)),
+		// metric input.%s.metricdata.invalid is a count of times a metricdata was invalid by input plugin
+		invalidMD: stats.NewCounterRate32(fmt.Sprintf("input.%s.metricdata.invalid", input)),
+		// metric input.%s.metricpoint.invalid is a count of times a metricpoint was invalid by input plugin
+		invalidMP: stats.NewCounterRate32(fmt.Sprintf("input.%s.metricpoint.invalid", input)),
+		// metric input.%s.metricpoint.unknown is the count of times the ID of a received metricpoint was not in the index, by input plugin
+		unknownMP: stats.NewCounter32(fmt.Sprintf("input.%s.metricpoint.unknown", input)),
 
 		metrics:     metrics,
 		metricIndex: metricIndex,
@@ -56,9 +63,11 @@ func (in DefaultHandler) ProcessMetricPoint(point schema.MetricPoint, format msg
 	} else {
 		in.receivedMPNO.Inc()
 	}
-	if !point.Valid() {
+	// in cassandra we store timestamps as 32bit signed integers.
+	// math.MaxInt32 = Jan 19 03:14:07 UTC 2038
+	if !point.Valid() || point.Time >= math.MaxInt32 {
 		in.invalidMP.Inc()
-		log.Debug("in: Invalid metric %v", point)
+		log.Debugf("in: Invalid metric %v", point)
 		return
 	}
 
@@ -80,18 +89,25 @@ func (in DefaultHandler) ProcessMetricData(md *schema.MetricData, partition int3
 	err := md.Validate()
 	if err != nil {
 		in.invalidMD.Inc()
-		log.Debug("in: Invalid metric %v: %s", md, err)
+		log.Debugf("in: Invalid metric %v: %s", md, err)
 		return
 	}
-	if md.Time == 0 {
+	// in cassandra we store timestamps and interval as 32bit signed integers.
+	// math.MaxInt32 = Jan 19 03:14:07 UTC 2038
+	if md.Time <= 0 || md.Time >= math.MaxInt32 {
 		in.invalidMD.Inc()
-		log.Warn("in: invalid metric. metric.Time is 0. %s", md.Id)
+		log.Warnf("in: invalid metric %q: .Time %d out of range", md.Id, md.Time)
+		return
+	}
+	if md.Interval <= 0 || md.Interval >= math.MaxInt32 {
+		in.invalidMD.Inc()
+		log.Warnf("in: invalid metric %q. .Interval %d out of range", md.Id, md.Interval)
 		return
 	}
 
 	mkey, err := schema.MKeyFromString(md.Id)
 	if err != nil {
-		log.Error(3, "in: Invalid metric %v: could not parse ID: %s", md, err)
+		log.Errorf("in: Invalid metric %v: could not parse ID: %s", md, err)
 		return
 	}
 

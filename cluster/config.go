@@ -5,10 +5,12 @@ import (
 	"flag"
 	"net"
 	"net/http"
+	"os"
+	"strconv"
 	"time"
 
-	"github.com/raintank/worldping-api/pkg/log"
-	"github.com/rakyll/globalconf"
+	"github.com/grafana/globalconf"
+	log "github.com/sirupsen/logrus"
 )
 
 var (
@@ -19,8 +21,12 @@ var (
 	maxPrio            int
 	httpTimeout        time.Duration
 	minAvailableShards int
+	gcPercent          int
+	gcPercentNotReady  int
 
 	swimUseConfig               = "default-lan"
+	swimAdvertiseAddrStr        string
+	swimAdvertiseAddr           *net.TCPAddr
 	swimBindAddrStr             string
 	swimBindAddr                *net.TCPAddr
 	swimTCPTimeout              time.Duration
@@ -44,6 +50,22 @@ var (
 )
 
 func ConfigSetup() {
+
+	// behavior here is same as standard runtime:
+	// unparseable or not set -> 100
+	// "off" -> -1
+	gcPercent = 100
+	gogc := os.Getenv("GOGC")
+	if gogc != "" {
+		if gogc == "off" {
+			gcPercent = -1
+		}
+		val, err := strconv.Atoi(gogc)
+		if err == nil {
+			gcPercent = val
+		}
+	}
+
 	clusterCfg := flag.NewFlagSet("cluster", flag.ExitOnError)
 	clusterCfg.StringVar(&ClusterName, "name", "metrictank", "Unique name of the cluster.")
 	clusterCfg.BoolVar(&primary, "primary-node", false, "the primary node writes data to cassandra. There should only be 1 primary node per shardGroup.")
@@ -52,11 +74,13 @@ func ConfigSetup() {
 	clusterCfg.DurationVar(&httpTimeout, "http-timeout", time.Second*60, "How long to wait before aborting http requests to cluster peers and returning a http 503 service unavailable")
 	clusterCfg.IntVar(&maxPrio, "max-priority", 10, "maximum priority before a node should be considered not-ready.")
 	clusterCfg.IntVar(&minAvailableShards, "min-available-shards", 0, "minimum number of shards that must be available for a query to be handled.")
-	globalconf.Register("cluster", clusterCfg)
+	clusterCfg.IntVar(&gcPercentNotReady, "gc-percent-not-ready", gcPercent, "GOGC value to use when node is not ready.  Defaults to GOGC")
+	globalconf.Register("cluster", clusterCfg, flag.ExitOnError)
 
 	swimCfg := flag.NewFlagSet("swim", flag.ExitOnError)
 	swimCfg.StringVar(&swimUseConfig, "use-config", "manual", "config setting to use. If set to anything but manual, will override all other swim settings. Use manual|default-lan|default-local|default-wan. see https://godoc.org/github.com/hashicorp/memberlist#Config . Note all our swim settings correspond to default-lan")
 	swimCfg.StringVar(&swimBindAddrStr, "bind-addr", "0.0.0.0:7946", "binding TCP Address for UDP and TCP gossip")
+	swimCfg.StringVar(&swimAdvertiseAddrStr, "advertise-addr", "", "advertised TCP address for UDP and TCP gossip (full ip/dns:port combo, or empty to use bind-addr)")
 	swimCfg.DurationVar(&swimTCPTimeout, "tcp-timeout", 10*time.Second, "timeout for establishing a stream connection with peers for a full state sync, and for stream reads and writes")
 	swimCfg.IntVar(&swimIndirectChecks, "indirect-checks", 3, "number of nodes that will be asked to perform an indirect probe of a node in the case a direct probe fails")
 	swimCfg.IntVar(&swimRetransmitMult, "retransmit-mult", 4, "multiplier for number of retransmissions for gossip messages. Retransmits = RetransmitMult * log(N+1)")
@@ -72,25 +96,19 @@ func ConfigSetup() {
 	swimCfg.DurationVar(&swimGossipToTheDeadTime, "gossip-to-the-dead-time", 30*time.Second, "interval after which a node has died that we will still try to gossip to it. This gives it a chance to refute")
 	swimCfg.BoolVar(&swimEnableCompression, "enable-compression", true, "message compression")
 	swimCfg.StringVar(&swimDNSConfigPath, "dns-config-path", "/etc/resolv.conf", "system's DNS config file. Override allows for easier testing")
-	globalconf.Register("swim", swimCfg)
+	globalconf.Register("swim", swimCfg, flag.ExitOnError)
 }
 
 func ConfigProcess() {
-
 	// check settings in cluster section
 	if !validMode(mode) {
-		log.Fatal(4, "CLU Config: invalid cluster operating mode")
+		log.Fatal("CLU Config: invalid cluster operating mode")
 	}
 
 	Mode = ModeType(mode)
 
-	// all further stuff is only relevant in multi mode
-	if mode != ModeMulti {
-		return
-	}
-
 	if httpTimeout == 0 {
-		log.Fatal(4, "CLU Config: http-timeout must be a non-zero duration string like 60s")
+		log.Fatal("CLU Config: http-timeout must be a non-zero duration string like 60s")
 	}
 
 	transport = &http.Transport{
@@ -107,16 +125,28 @@ func ConfigProcess() {
 		Timeout:   httpTimeout,
 	}
 
+	// all further stuff is only relevant in multi mode
+	if mode != ModeMulti {
+		return
+	}
+
 	// check settings in swim section
 	if swimUseConfig != "manual" && swimUseConfig != "default-lan" && swimUseConfig != "default-local" && swimUseConfig != "default-wan" {
-		log.Fatal(4, "CLU Config: invalid swim-use-config setting")
+		log.Fatal("CLU Config: invalid swim-use-config setting")
 	}
 
 	if swimUseConfig == "manual" {
 		var err error
 		swimBindAddr, err = net.ResolveTCPAddr("tcp", swimBindAddrStr)
 		if err != nil {
-			log.Fatal(4, "CLU Config: swim-bind-addr is not a valid TCP address: %s", err.Error())
+			log.Fatalf("CLU Config: swim-bind-addr is not a valid TCP address: %s", err.Error())
+		}
+
+		if swimAdvertiseAddrStr != "" {
+			swimAdvertiseAddr, err = net.ResolveTCPAddr("tcp", swimAdvertiseAddrStr)
+			if err != nil {
+				log.Fatalf("CLU Config: swim-advertise-addr is not a valid TCP address: %s", err.Error())
+			}
 		}
 	}
 }

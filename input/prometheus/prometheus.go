@@ -1,6 +1,7 @@
 package prometheus
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"io/ioutil"
@@ -8,13 +9,13 @@ import (
 
 	"github.com/gogo/protobuf/proto"
 	"github.com/golang/snappy"
+	"github.com/grafana/globalconf"
 	"github.com/grafana/metrictank/cluster"
 	"github.com/grafana/metrictank/input"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/prompb"
-	"github.com/raintank/worldping-api/pkg/log"
-	"github.com/rakyll/globalconf"
-	schema "gopkg.in/raintank/schema.v1"
+	"github.com/raintank/schema"
+	log "github.com/sirupsen/logrus"
 )
 
 var (
@@ -25,7 +26,6 @@ var (
 
 type prometheusWriteHandler struct {
 	input.Handler
-	quit chan struct{}
 }
 
 func New() *prometheusWriteHandler {
@@ -36,9 +36,8 @@ func (p *prometheusWriteHandler) Name() string {
 	return "prometheus"
 }
 
-func (p *prometheusWriteHandler) Start(handler input.Handler, fatal chan struct{}) error {
+func (p *prometheusWriteHandler) Start(handler input.Handler, cancel context.CancelFunc) error {
 	p.Handler = handler
-	p.quit = fatal
 	ConfigSetup()
 
 	mux := http.NewServeMux()
@@ -71,14 +70,14 @@ func (p *prometheusWriteHandler) handle(w http.ResponseWriter, req *http.Request
 		if err != nil {
 			w.WriteHeader(400)
 			w.Write([]byte(fmt.Sprintf("Read Error, %v", err)))
-			log.Error(3, "Read Error, %v", err)
+			log.Errorf("Read Error, %v", err)
 			return
 		}
 		reqBuf, err := snappy.Decode(nil, compressed)
 		if err != nil {
 			w.WriteHeader(400)
 			w.Write([]byte(fmt.Sprintf("Decode Error, %v", err)))
-			log.Error(3, "Decode Error, %v", err)
+			log.Errorf("Decode Error, %v", err)
 			return
 		}
 
@@ -86,7 +85,7 @@ func (p *prometheusWriteHandler) handle(w http.ResponseWriter, req *http.Request
 		if err := proto.Unmarshal(reqBuf, &req); err != nil {
 			w.WriteHeader(400)
 			w.Write([]byte(fmt.Sprintf("Unmarshal Error, %v", err)))
-			log.Error(3, "Unmarshal Error, %v", err)
+			log.Errorf("Unmarshal Error, %v", err)
 			return
 		}
 
@@ -119,12 +118,12 @@ func (p *prometheusWriteHandler) handle(w http.ResponseWriter, req *http.Request
 			} else {
 				w.WriteHeader(400)
 				w.Write([]byte("invalid metric received: __name__ label can not equal \"\""))
-				log.Warn("prometheus metric received with empty name: %v", ts.String())
+				log.Warnf("prometheus metric received with empty name: %v", ts.String())
 				return
 			}
 		}
 		if err != nil {
-			w.WriteHeader(500)
+			w.WriteHeader(http.StatusInternalServerError)
 			w.Write([]byte(err.Error()))
 			return
 		}
@@ -140,7 +139,7 @@ func ConfigSetup() {
 	inPrometheus.BoolVar(&Enabled, "enabled", false, "")
 	inPrometheus.StringVar(&addr, "addr", ":8000", "http listen address")
 	inPrometheus.IntVar(&partitionID, "partition", 0, "partition Id.")
-	globalconf.Register("prometheus-in", inPrometheus)
+	globalconf.Register("prometheus-in", inPrometheus, flag.ExitOnError)
 }
 
 func ConfigProcess() {

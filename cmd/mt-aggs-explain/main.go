@@ -6,16 +6,24 @@ import (
 	"os"
 	"runtime"
 
-	log "github.com/Sirupsen/logrus"
 	"github.com/grafana/metrictank/conf"
 	"github.com/grafana/metrictank/consolidation"
+	"github.com/grafana/metrictank/logger"
+	log "github.com/sirupsen/logrus"
 )
 
 var (
-	gitHash     = "(none)"
+	version     = "(none)"
 	showVersion = flag.Bool("version", false, "print version string")
 	metric      = flag.String("metric", "", "specify a metric name to see which aggregation rule it matches")
 )
+
+func init() {
+	formatter := &logger.TextFormatter{}
+	formatter.TimestampFormat = "2006-01-02 15:04:05.000"
+	log.SetFormatter(formatter)
+	log.SetLevel(log.InfoLevel)
+}
 
 func main() {
 	flag.Usage = func() {
@@ -32,7 +40,7 @@ func main() {
 	flag.Parse()
 
 	if *showVersion {
-		fmt.Printf("mt-aggs-explain (built with %s, git hash %s)\n", runtime.Version(), gitHash)
+		fmt.Printf("mt-aggs-explain (version: %s - runtime: %s)\n", version, runtime.Version())
 		return
 	}
 	if flag.NArg() > 1 {

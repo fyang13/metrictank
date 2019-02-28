@@ -10,7 +10,7 @@ Metrictank is a multi-tenant timeseries engine for Graphite and friends.
 It provides long term storage, high availability, efficient storage, retrieval and processing for large scale environments.
 
 [GrafanaLabs](http://grafana.com) has been running metrictank in production since December 2015.
-It currently requires an external datastore like Cassandra, and we highly recommend using Kafka to support clustering, as well
+It currently requires an external datastore like Cassandra or Bigtable, and we highly recommend using Kafka to support clustering, as well
 as a clustering manager like Kubernetes. This makes it non-trivial to operate, though GrafanaLabs has an on-premise product
 that makes this process much easier.
 
@@ -55,6 +55,7 @@ Otherwise data loss of current chunks will be incurred.  See [operations guide](
 
 * [Overview](https://github.com/grafana/metrictank/blob/master/docs/overview.md)
 * [Quick start using docker](https://github.com/grafana/metrictank/blob/master/docs/quick-start-docker.md)
+  ([more docker information](docs/docker.md))
 * [Installation guides](https://github.com/grafana/metrictank/blob/master/docs/installation.md)
 * [Configuration](https://github.com/grafana/metrictank/blob/master/docs/config.md)
 * [Memory server](https://github.com/grafana/metrictank/blob/master/docs/memory-server.md)
@@ -64,6 +65,7 @@ Otherwise data loss of current chunks will be incurred.  See [operations guide](
 * [Inputs](https://github.com/grafana/metrictank/blob/master/docs/inputs.md)
 * [Metrics](https://github.com/grafana/metrictank/blob/master/docs/metrics.md)
 * [Operations](https://github.com/grafana/metrictank/blob/master/docs/operations.md)
+* [Startup](https://github.com/grafana/metrictank/blob/master/docs/startup.md)
 * [Tools](https://github.com/grafana/metrictank/blob/master/docs/tools.md)
 
 ### features in-depth
@@ -78,7 +80,7 @@ Otherwise data loss of current chunks will be incurred.  See [operations guide](
 
 ### Other
 
-* [Development](https://github.com/grafana/metrictank/blob/master/docs/development.md)
+* [Development and contributing](https://github.com/grafana/metrictank/blob/master/docs/CONTRIBUTING.md)
 * [Community](https://github.com/grafana/metrictank/blob/master/docs/community.md)
 * [Roadmap](https://github.com/grafana/metrictank/blob/master/docs/roadmap.md)
 * [Faq](https://github.com/grafana/metrictank/blob/master/docs/faq.md)

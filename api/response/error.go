@@ -2,6 +2,10 @@ package response
 
 import (
 	"encoding/json"
+	"net/http"
+	"runtime/debug"
+
+	log "github.com/sirupsen/logrus"
 )
 
 type Error interface {
@@ -15,16 +19,19 @@ type ErrorResp struct {
 }
 
 func WrapError(e error) *ErrorResp {
-	if _, ok := e.(*ErrorResp); ok {
-		return e.(*ErrorResp)
+	if err, ok := e.(*ErrorResp); ok {
+		err.ValidateAndFixCode()
+		return err
 	}
 	resp := &ErrorResp{
 		err:  e.Error(),
-		code: 500,
+		code: http.StatusInternalServerError,
 	}
 	if _, ok := e.(Error); ok {
 		resp.code = e.(Error).Code()
 	}
+
+	resp.ValidateAndFixCode()
 	return resp
 }
 
@@ -38,19 +45,20 @@ func WrapErrorForTagDB(e error) *ErrorResp {
 	if err != nil {
 		return &ErrorResp{
 			err:  "{\"error\": \"failed to encode error message\"}",
-			code: 500,
+			code: http.StatusInternalServerError,
 		}
 	}
 
 	resp := &ErrorResp{
 		err:  string(b),
-		code: 500,
+		code: http.StatusInternalServerError,
 	}
 
 	if _, ok := e.(Error); ok {
 		resp.code = e.(Error).Code()
 	}
 
+	resp.ValidateAndFixCode()
 	return resp
 }
 
@@ -80,6 +88,15 @@ func (r *ErrorResp) Body() ([]byte, error) {
 func (r *ErrorResp) Headers() (headers map[string]string) {
 	headers = map[string]string{"content-type": "text/plain"}
 	return headers
+}
+
+func (r *ErrorResp) ValidateAndFixCode() {
+	// 599 is max HTTP status code
+	if r.code > 599 {
+		log.Warnf("Encountered invalid HTTP status code %d, printing stack", r.code)
+		debug.PrintStack()
+		r.code = http.StatusInternalServerError
+	}
 }
 
 var RequestCanceledErr = NewError(499, "request canceled")

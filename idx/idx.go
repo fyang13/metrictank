@@ -3,18 +3,12 @@
 package idx
 
 import (
-	"errors"
 	"time"
 
-	schema "gopkg.in/raintank/schema.v1"
+	"github.com/raintank/schema"
 )
 
 var OrgIdPublic = uint32(0)
-
-var (
-	BothBranchAndLeaf = errors.New("node can't be both branch and leaf")
-	BranchUnderLeaf   = errors.New("can't add branch under leaf")
-)
 
 //go:generate msgp
 type Node struct {
@@ -28,6 +22,7 @@ type Archive struct {
 	schema.MetricDefinition
 	SchemaId uint16 // index in mdata.schemas (not persisted)
 	AggId    uint16 // index in mdata.aggregations (not persisted)
+	IrId     uint16 // index in mdata.indexrules (not persisted)
 	LastSave uint32 // last time the metricDefinition was saved to a backend store (cassandra)
 }
 

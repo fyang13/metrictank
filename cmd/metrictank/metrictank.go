@@ -1,9 +1,11 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	l "log"
+	_ "net/http/pprof"
 	"os"
 	"os/signal"
 	"runtime"
@@ -13,37 +15,36 @@ import (
 	"syscall"
 	"time"
 
-	_ "net/http/pprof"
-
 	"github.com/Dieterbe/profiletrigger/heap"
 	"github.com/Shopify/sarama"
+	"github.com/grafana/globalconf"
 	"github.com/grafana/metrictank/api"
 	"github.com/grafana/metrictank/cluster"
 	"github.com/grafana/metrictank/conf"
 	"github.com/grafana/metrictank/idx"
+	"github.com/grafana/metrictank/idx/bigtable"
 	"github.com/grafana/metrictank/idx/cassandra"
 	"github.com/grafana/metrictank/idx/memory"
 	"github.com/grafana/metrictank/input"
 	inCarbon "github.com/grafana/metrictank/input/carbon"
 	inKafkaMdm "github.com/grafana/metrictank/input/kafkamdm"
 	inPrometheus "github.com/grafana/metrictank/input/prometheus"
+	"github.com/grafana/metrictank/logger"
 	"github.com/grafana/metrictank/mdata"
 	"github.com/grafana/metrictank/mdata/cache"
 	"github.com/grafana/metrictank/mdata/notifierKafka"
-	"github.com/grafana/metrictank/mdata/notifierNsq"
 	"github.com/grafana/metrictank/stats"
 	statsConfig "github.com/grafana/metrictank/stats/config"
+	bigtableStore "github.com/grafana/metrictank/store/bigtable"
 	cassandraStore "github.com/grafana/metrictank/store/cassandra"
 	"github.com/raintank/dur"
-	"github.com/raintank/worldping-api/pkg/log"
-	"github.com/rakyll/globalconf"
+	log "github.com/sirupsen/logrus"
 )
 
 var (
-	logLevel     int
 	warmupPeriod time.Duration
 	startupTime  time.Time
-	gitHash      = "(none)"
+	version      = "(none)"
 
 	metrics     *mdata.AggMetrics
 	metricIndex idx.MetricIndex
@@ -59,12 +60,14 @@ var (
 	// Data:
 	dropFirstChunk    = flag.Bool("drop-first-chunk", false, "forego persisting of first received (and typically incomplete) chunk")
 	chunkMaxStaleStr  = flag.String("chunk-max-stale", "1h", "max age for a chunk before to be considered stale and to be persisted to Cassandra.")
-	metricMaxStaleStr = flag.String("metric-max-stale", "6h", "max age for a metric before to be considered stale and to be purged from memory.")
+	metricMaxStaleStr = flag.String("metric-max-stale", "3h", "max age for a metric before to be considered stale and to be purged from memory.")
 	gcIntervalStr     = flag.String("gc-interval", "1h", "Interval to run garbage collection job.")
 	warmUpPeriodStr   = flag.String("warm-up-period", "1h", "duration before secondary nodes start serving requests")
 	publicOrg         = flag.Int("public-org", 0, "org Id for publically (any org) accessible data. leave 0 to disable")
 
 	// Profiling, instrumentation and logging:
+	logLevel = flag.String("log-level", "info", "log level. panic|fatal|error|warning|info|debug")
+
 	blockProfileRate = flag.Int("block-profile-rate", 0, "see https://golang.org/pkg/runtime/#SetBlockProfileRate")
 	memProfileRate   = flag.Int("mem-profile-rate", 512*1024, "0 to disable. 1 for max precision (expensive!) see https://golang.org/pkg/runtime/#pkg-variables")
 
@@ -78,26 +81,14 @@ var (
 	tracingAddTags = flag.String("tracing-add-tags", "", "tracer/process-level tags to include, specified as comma-separated key:value pairs")
 )
 
-func init() {
-	flag.IntVar(&logLevel, "log-level", 2, "log level. 0=TRACE|1=DEBUG|2=INFO|3=WARN|4=ERROR|5=CRITICAL|6=FATAL")
-}
-
 func main() {
 	startupTime = time.Now()
 
-	/***********************************
-		Initialize Logger
-	***********************************/
-	log.NewLogger(0, "console", fmt.Sprintf(`{"level": %d, "formatting":false}`, logLevel))
-
-	/***********************************
-		Initialize Configuration
-	***********************************/
 	flag.Parse()
 
 	// if the user just wants the version, give it and exit
 	if *showVersion {
-		fmt.Printf("metrictank (built with %s, git hash %s)\n", runtime.Version(), gitHash)
+		fmt.Printf("metrictank (version: %s - runtime: %s)\n", version, runtime.Version())
 		return
 	}
 
@@ -111,7 +102,7 @@ func main() {
 		EnvPrefix: "MT_",
 	})
 	if err != nil {
-		log.Fatal(4, "error with configuration file: %s", err)
+		fmt.Fprintf(os.Stderr, "FATAL: configuration file error: %s", err)
 		os.Exit(1)
 	}
 	// load config for metric ingestors
@@ -119,12 +110,10 @@ func main() {
 	inKafkaMdm.ConfigSetup()
 	inPrometheus.ConfigSetup()
 
-	// load config for cluster handlers
-	notifierNsq.ConfigSetup()
-
 	// load config for metricIndexers
 	memory.ConfigSetup()
 	cassandra.ConfigSetup()
+	bigtable.ConfigSetup()
 
 	// load config for API
 	api.ConfigSetup()
@@ -141,41 +130,31 @@ func main() {
 	// cassandra Store
 	cassandraStore.ConfigSetup()
 
+	// bigtable store
+	bigtableStore.ConfigSetup()
+
 	config.ParseAll()
 
 	/***********************************
-		Set logging levels
+		Set up Logger
 	***********************************/
-	mdata.LogLevel = logLevel
-	memory.LogLevel = logLevel
-	inKafkaMdm.LogLevel = logLevel
-	api.LogLevel = logLevel
-	// workaround for https://github.com/grafana/grafana/issues/4055
-	switch logLevel {
-	case 0:
-		log.Level(log.TRACE)
-	case 1:
-		log.Level(log.DEBUG)
-	case 2:
-		log.Level(log.INFO)
-	case 3:
-		log.Level(log.WARN)
-	case 4:
-		log.Level(log.ERROR)
-	case 5:
-		log.Level(log.CRITICAL)
-	case 6:
-		log.Level(log.FATAL)
+
+	formatter := &logger.TextFormatter{}
+	formatter.TimestampFormat = "2006-01-02 15:04:05.000"
+	log.SetFormatter(formatter)
+	lvl, err := log.ParseLevel(*logLevel)
+	if err != nil {
+		log.Fatalf("failed to parse log-level, %s", err.Error())
 	}
+	log.SetLevel(lvl)
+	log.Infof("logging level set to '%s'", *logLevel)
 
 	/***********************************
-		Validate  settings needed for clustering
+		Validate settings needed for clustering
 	***********************************/
 	if *instance == "" {
-		log.Fatal(4, "instance can't be empty")
+		log.Fatal("instance can't be empty")
 	}
-
-	log.Info("Metrictank starting. Built from %s - Go version %s", gitHash, runtime.Version())
 
 	/***********************************
 		Initialize our Cluster
@@ -189,23 +168,27 @@ func main() {
 	addrParts := strings.Split(api.Addr, ":")
 	port, err := strconv.ParseInt(addrParts[len(addrParts)-1], 10, 64)
 	if err != nil {
-		log.Fatal(4, "Could not parse port from listenAddr. %s", api.Addr)
+		log.Fatalf("Could not parse port from listenAddr. %s", api.Addr)
 	}
-	cluster.Init(*instance, gitHash, startupTime, scheme, int(port))
+	cluster.Init(*instance, version, startupTime, scheme, int(port))
 
 	/***********************************
 		Validate remaining settings
 	***********************************/
 	inCarbon.ConfigProcess()
 	inKafkaMdm.ConfigProcess(*instance)
+	memory.ConfigProcess()
 	inPrometheus.ConfigProcess()
-	notifierNsq.ConfigProcess()
 	notifierKafka.ConfigProcess(*instance)
 	statsConfig.ConfigProcess(*instance)
 	mdata.ConfigProcess()
+	memory.ConfigProcess()
+	cassandra.ConfigProcess()
+	bigtable.ConfigProcess()
+	bigtableStore.ConfigProcess(mdata.MaxChunkSpan())
 
 	if !inCarbon.Enabled && !inKafkaMdm.Enabled && !inPrometheus.Enabled {
-		log.Fatal(4, "you should enable at least 1 input plugin")
+		log.Fatal("you should enable at least 1 input plugin")
 	}
 
 	sec := dur.MustParseNDuration("warm-up-period", *warmUpPeriodStr)
@@ -222,7 +205,7 @@ func main() {
 		trigger, _ := heap.New(*proftrigPath, *proftrigHeapThresh, proftrigMinDiff, time.Duration(proftrigFreq)*time.Second, errors)
 		go func() {
 			for e := range errors {
-				log.Error(0, "profiletrigger heap: %s", e)
+				log.Errorf("profiletrigger heap: %s", e)
 			}
 		}()
 		go trigger.Run()
@@ -241,6 +224,14 @@ func main() {
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
 	/***********************************
+		Report Version
+	***********************************/
+	log.Infof("Metrictank starting. version: %s - runtime: %s", version, runtime.Version())
+	// metric version.%s is the version of metrictank running.  The metric value is always 1
+	mtVersion := stats.NewBool(fmt.Sprintf("version.%s", strings.Replace(version, ".", "_", -1)))
+	mtVersion.Set(true)
+
+	/***********************************
 		collect stats
 	***********************************/
 	statsConfig.Start()
@@ -256,23 +247,38 @@ func main() {
 		for _, tagSpec := range tagSpecs {
 			split := strings.Split(tagSpec, ":")
 			if len(split) != 2 {
-				log.Fatal(4, "cannot parse tracing-add-tags value %q", tagSpec)
+				log.Fatalf("cannot parse tracing-add-tags value %q", tagSpec)
 			}
 			tags[split[0]] = split[1]
 		}
 	}
 	tracer, traceCloser, err := conf.GetTracer(*tracingEnabled, *tracingAddr, tags)
 	if err != nil {
-		log.Fatal(4, "Could not initialize jaeger tracer: %s", err.Error())
+		log.Fatalf("Could not initialize jaeger tracer: %s", err.Error())
 	}
 	defer traceCloser.Close()
 
 	/***********************************
 		Initialize our backendStore
 	***********************************/
-	store, err = cassandraStore.NewCassandraStore(cassandraStore.CliConfig, mdata.TTLs())
-	if err != nil {
-		log.Fatal(4, "failed to initialize cassandra. %s", err)
+	if cassandraStore.CliConfig.Enabled && bigtableStore.CliConfig.Enabled {
+		log.Fatal("only 1 backend store plugin can be enabled at once.")
+	}
+	if !cassandraStore.CliConfig.Enabled && !bigtableStore.CliConfig.Enabled {
+		log.Fatal("at least 1 backend store plugin needs to be enabled.")
+	}
+	if bigtableStore.CliConfig.Enabled {
+		schemaMaxChunkSpan := mdata.MaxChunkSpan()
+		store, err = bigtableStore.NewStore(bigtableStore.CliConfig, mdata.TTLs(), schemaMaxChunkSpan)
+		if err != nil {
+			log.Fatalf("failed to initialize bigtable backend store. %s", err)
+		}
+	}
+	if cassandraStore.CliConfig.Enabled {
+		store, err = cassandraStore.NewCassandraStore(cassandraStore.CliConfig, mdata.TTLs())
+		if err != nil {
+			log.Fatalf("failed to initialize cassandra backend store. %s", err)
+		}
 	}
 	store.SetTracer(tracer)
 
@@ -319,26 +325,32 @@ func main() {
 	pre := time.Now()
 
 	if *publicOrg < 0 {
-		log.Fatal(4, "public-org cannot be <0")
+		log.Fatal("public-org cannot be <0")
 	}
 
 	idx.OrgIdPublic = uint32(*publicOrg)
 
 	if memory.Enabled {
 		if metricIndex != nil {
-			log.Fatal(4, "Only 1 metricIndex handler can be enabled.")
+			log.Fatal("Only 1 metricIndex handler can be enabled.")
 		}
 		metricIndex = memory.New()
 	}
-	if cassandra.Enabled {
+	if cassandra.CliConfig.Enabled {
 		if metricIndex != nil {
-			log.Fatal(4, "Only 1 metricIndex handler can be enabled.")
+			log.Fatal("Only 1 metricIndex handler can be enabled.")
 		}
-		metricIndex = cassandra.New()
+		metricIndex = cassandra.New(cassandra.CliConfig)
+	}
+	if bigtable.CliConfig.Enabled {
+		if metricIndex != nil {
+			log.Fatal("Only 1 metricIndex handler can be enabled.")
+		}
+		metricIndex = bigtable.New(bigtable.CliConfig)
 	}
 
 	if metricIndex == nil {
-		log.Fatal(4, "No metricIndex handlers enabled.")
+		log.Fatal("No metricIndex handlers enabled.")
 	}
 
 	/***********************************
@@ -346,7 +358,7 @@ func main() {
 	***********************************/
 	apiServer, err = api.NewServer()
 	if err != nil {
-		log.Fatal(4, "Failed to start API. %s", err.Error())
+		log.Fatalf("Failed to start API. %s", err.Error())
 	}
 
 	apiServer.BindMetricIndex(metricIndex)
@@ -363,35 +375,31 @@ func main() {
 	***********************************/
 	err = metricIndex.Init()
 	if err != nil {
-		log.Fatal(4, "failed to initialize metricIndex: %s", err)
+		log.Fatalf("failed to initialize metricIndex: %s", err.Error())
 	}
-	log.Info("metricIndex initialized in %s. starting data consumption", time.Now().Sub(pre))
+	log.Infof("metricIndex initialized in %s. starting data consumption", time.Now().Sub(pre))
 
 	/***********************************
 		Initialize MetricPersist notifiers
 	***********************************/
-	handlers := make([]mdata.NotifierHandler, 0)
+	var notifiers []mdata.Notifier
 	if notifierKafka.Enabled {
-		// The notifierKafka handler will block here until it has processed the backlog of metricPersist messages.
+		// The notifierKafka notifiers will block here until it has processed the backlog of metricPersist messages.
 		// it will block for at most kafka-cluster.backlog-process-timeout (default 60s)
-		handlers = append(handlers, notifierKafka.New(*instance, metrics, metricIndex))
+		notifiers = append(notifiers, notifierKafka.New(*instance, mdata.NewDefaultNotifierHandler(metrics, metricIndex)))
 	}
 
-	if notifierNsq.Enabled {
-		handlers = append(handlers, notifierNsq.New(*instance, metrics, metricIndex))
-	}
-
-	mdata.InitPersistNotifier(handlers...)
+	mdata.InitPersistNotifier(notifiers...)
 
 	/***********************************
 		Start our inputs
 	***********************************/
-	pluginFatal := make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
 	for _, plugin := range inputs {
 		if carbonPlugin, ok := plugin.(*inCarbon.Carbon); ok {
 			carbonPlugin.IntervalGetter(inCarbon.NewIndexIntervalGetter(metricIndex))
 		}
-		err = plugin.Start(input.NewDefaultHandler(metrics, metricIndex, plugin.Name()), pluginFatal)
+		err = plugin.Start(input.NewDefaultHandler(metrics, metricIndex, plugin.Name()), cancel)
 		if err != nil {
 			shutdown()
 			return
@@ -422,8 +430,8 @@ func main() {
 	***********************************/
 	select {
 	case sig := <-sigChan:
-		log.Info("Received signal %q. Shutting down", sig)
-	case <-pluginFatal:
+		log.Infof("Received signal %q. Shutting down", sig)
+	case <-ctx.Done():
 		log.Info("An input plugin signalled a fatal error. Shutting down")
 	}
 	shutdown()
@@ -444,9 +452,9 @@ func shutdown() {
 	for _, plugin := range inputs {
 		wg.Add(1)
 		go func(plugin input.Plugin) {
-			log.Info("Shutting down %s consumer", plugin.Name())
+			log.Infof("Shutting down %s consumer", plugin.Name())
 			plugin.Stop()
-			log.Info("%s consumer finished shutdown", plugin.Name())
+			log.Infof("%s consumer finished shutdown", plugin.Name())
 			wg.Done()
 		}(plugin)
 	}
@@ -466,5 +474,4 @@ func shutdown() {
 	store.Stop()
 	metricIndex.Stop()
 	log.Info("terminating.")
-	log.Close()
 }

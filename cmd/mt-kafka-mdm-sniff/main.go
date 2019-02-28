@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"math/rand"
@@ -13,12 +14,13 @@ import (
 	"text/template"
 	"time"
 
+	"github.com/grafana/globalconf"
 	inKafkaMdm "github.com/grafana/metrictank/input/kafkamdm"
+	"github.com/grafana/metrictank/logger"
 	"github.com/grafana/metrictank/stats"
-	"github.com/raintank/worldping-api/pkg/log"
-	"github.com/rakyll/globalconf"
-	"gopkg.in/raintank/schema.v1"
-	"gopkg.in/raintank/schema.v1/msg"
+	"github.com/raintank/schema"
+	"github.com/raintank/schema/msg"
+	log "github.com/sirupsen/logrus"
 )
 
 var (
@@ -92,7 +94,7 @@ func (ip inputPrinter) ProcessMetricData(metric *schema.MetricData, partition in
 
 	stdoutLock.Unlock()
 	if err != nil {
-		log.Error(0, "executing template: %s", err)
+		log.Errorf("executing template: %s", err.Error())
 	}
 }
 
@@ -109,7 +111,7 @@ func (ip inputPrinter) ProcessMetricPoint(point schema.MetricPoint, format msg.F
 	})
 	stdoutLock.Unlock()
 	if err != nil {
-		log.Error(0, "executing template: %s", err)
+		log.Errorf("executing template: %s", err.Error())
 	}
 }
 
@@ -125,7 +127,10 @@ func main() {
 		fmt.Fprintln(os.Stderr, "example: mt-kafka-mdm-sniff -format-point '{{.Time | date}}'")
 	}
 	flag.Parse()
-	log.NewLogger(0, "console", fmt.Sprintf(`{"level": %d, "formatting":false}`, 2))
+	formatter := &logger.TextFormatter{}
+	formatter.TimestampFormat = "2006-01-02 15:04:05.000"
+	log.SetFormatter(formatter)
+	log.SetLevel(log.InfoLevel)
 	instance := "mt-kafka-mdm-sniff" + strconv.Itoa(rand.Int())
 
 	// Only try and parse the conf file if it exists
@@ -138,7 +143,7 @@ func main() {
 		EnvPrefix: "MT_",
 	})
 	if err != nil {
-		log.Fatal(4, "error with configuration file: %s", err)
+		log.Fatalf("error with configuration file: %s", err.Error())
 		os.Exit(1)
 	}
 	inKafkaMdm.ConfigSetup()
@@ -146,22 +151,20 @@ func main() {
 
 	// config may have had it disabled
 	inKafkaMdm.Enabled = true
-	// important: we don't want to share the same offset tracker as the mdm input of MT itself
-	inKafkaMdm.DataDir = "/tmp/" + instance
 
 	inKafkaMdm.ConfigProcess(instance)
 
 	stats.NewDevnull() // make sure metrics don't pile up without getting discarded
 
 	mdm := inKafkaMdm.New()
-	pluginFatal := make(chan struct{})
-	mdm.Start(newInputPrinter(*formatMd, *formatP), pluginFatal)
+	ctx, cancel := context.WithCancel(context.Background())
+	mdm.Start(newInputPrinter(*formatMd, *formatP), cancel)
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	select {
 	case sig := <-sigChan:
-		log.Info("Received signal %q. Shutting down", sig)
-	case <-pluginFatal:
+		log.Infof("Received signal %q. Shutting down", sig)
+	case <-ctx.Done():
 		log.Info("Mdm input plugin signalled a fatal error. Shutting down")
 	}
 	mdm.Stop()

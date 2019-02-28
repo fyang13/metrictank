@@ -7,14 +7,14 @@ import (
 	"runtime"
 	"sync"
 
+	"github.com/grafana/globalconf"
 	"github.com/grafana/metrictank/mdata/cache/accnt"
 	"github.com/grafana/metrictank/mdata/chunk"
 	"github.com/grafana/metrictank/stats"
 	"github.com/grafana/metrictank/tracing"
 	opentracing "github.com/opentracing/opentracing-go"
-	"github.com/raintank/worldping-api/pkg/log"
-	"github.com/rakyll/globalconf"
-	"gopkg.in/raintank/schema.v1"
+	"github.com/raintank/schema"
+	log "github.com/sirupsen/logrus"
 )
 
 var (
@@ -27,7 +27,7 @@ func init() {
 	flags := flag.NewFlagSet("chunk-cache", flag.ExitOnError)
 	// (1024 ^ 3) * 4 = 4294967296 = 4G
 	flags.Uint64Var(&maxSize, "max-size", 4294967296, "Maximum size of chunk cache in bytes. 0 disables cache")
-	globalconf.Register("chunk-cache", flags)
+	globalconf.Register("chunk-cache", flags, flag.ExitOnError)
 }
 
 type CCache struct {
@@ -134,7 +134,7 @@ func (c *CCache) AddIfHot(metric schema.AMKey, prev uint32, itergen chunk.IterGe
 	// if the previous chunk is not cached we consider the metric not hot enough to cache this chunk
 	// only works reliably if the last chunk of that metric is span aware, otherwise lastTs() will be guessed
 	// conservatively which means that the returned value will probably be lower than the real last ts
-	if met.lastTs() < itergen.Ts {
+	if met.lastTs() < itergen.T0 {
 		c.RUnlock()
 		return
 	}
@@ -172,7 +172,7 @@ func (c *CCache) Add(metric schema.AMKey, prev uint32, itergen chunk.IterGen) {
 		ccm.Add(prev, itergen)
 	}
 
-	c.accnt.AddChunk(metric, itergen.Ts, itergen.Size())
+	c.accnt.AddChunk(metric, itergen.T0, itergen.Size())
 }
 
 func (c *CCache) AddRange(metric schema.AMKey, prev uint32, itergens []chunk.IterGen) {
@@ -240,7 +240,7 @@ func (c *CCache) evict(target *accnt.EvictTarget) {
 		return
 	}
 
-	log.Debug("CCache evict: evicting chunk %d on metric %s\n", target.Ts, target.Metric)
+	log.Debugf("CCache evict: evicting chunk %d on metric %s\n", target.Ts, target.Metric)
 	length := c.metricCache[target.Metric].Del(target.Ts)
 	if length == 0 {
 		delete(c.metricCache, target.Metric)

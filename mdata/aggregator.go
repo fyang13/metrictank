@@ -3,7 +3,7 @@ package mdata
 import (
 	"github.com/grafana/metrictank/conf"
 	"github.com/grafana/metrictank/mdata/cache"
-	schema "gopkg.in/raintank/schema.v1"
+	"github.com/raintank/schema"
 )
 
 // AggBoundary returns ts if it is a boundary, or the next boundary otherwise.
@@ -116,6 +116,7 @@ func (agg *Aggregator) Add(ts uint32, val float64) {
 	}
 }
 
+// GC returns whether all of the associated series are stale and can be removed
 func (agg *Aggregator) GC(now, chunkMinTs, metricMinTs, lastWriteTime uint32) bool {
 	ret := true
 

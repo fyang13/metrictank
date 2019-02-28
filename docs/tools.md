@@ -64,12 +64,20 @@ global config flags:
     	for vegeta outputs, will generate requests for data starting from now minus... eg '30min', '5h', '14d', etc. or a unix timestamp (default "30min")
   -limit int
     	only show this many metrics.  use 0 to disable
-  -max-age string
-    	max age (last update diff with now) of metricdefs.  use 0 to disable (default "6h30min")
+  -max-stale string
+    	exclude series that have not been seen for this much time.  use 0 to disable (default "6h30min")
+  -min-stale string
+    	exclude series that have been seen in this much time.  use 0 to disable (default "0")
+  -partitions string
+    	only show metrics from the comma separated list of partitions or * for all (default "*")
   -prefix string
     	only show metrics that have this prefix
+  -regex string
+    	only show metrics that match this regex
   -substr string
     	only show metrics that have this substring
+  -suffix string
+    	only show metrics that have this suffix
   -tags string
     	tag filter. empty (default), 'some', 'none', 'valid', or 'invalid'
   -verbose
@@ -104,8 +112,6 @@ cass config flags:
     	comma separated list of cassandra addresses in host:port form (default "localhost:9042")
   -keyspace string
     	Cassandra keyspace to store metricDefinitions in. (default "metrictank")
-  -max-stale duration
-    	clear series from the index if they have not been seen for this much time.
   -num-conns int
     	number of concurrent connections to cassandra (default 10)
   -password string
@@ -129,19 +135,33 @@ cass config flags:
   -write-queue-size int
     	Max number of metricDefs allowed to be unwritten to cassandra (default 100000)
 
-output: either presets like dump|list|vegeta-render|vegeta-render-patterns
-output: or custom templates like '{{.Id}} {{.OrgId}} {{.Name}} {{.Metric}} {{.Interval}} {{.Unit}} {{.Mtype}} {{.Tags}} {{.LastUpdate}} {{.Partition}}'
+output:
+
+ * presets: dump|list|vegeta-render|vegeta-render-patterns
+ * templates, which may contain:
+   - fields,  e.g. '{{.Id}} {{.OrgId}} {{.Name}} {{.Interval}} {{.Unit}} {{.Mtype}} {{.Tags}} {{.LastUpdate}} {{.Partition}}'
+   - methods, e.g. '{{.NameWithTags}}' (works basically the same as a field)
+   - processing functions:
+     pattern:       transforms a graphite.style.metric.name into a pattern with wildcards inserted
+                    an operation is randomly selected between: replacing a node with a wildcard, replacing a character with a wildcard, and passthrough
+     patternCustom: transforms a graphite.style.metric.name into a pattern with wildcards inserted according to rules provided:
+                    patternCustom <chance> <operation>[ <chance> <operation>...]
+                    the chances need to add up to 100
+                    operation is one of:
+                      * pass        (passthrough)
+                      * <digit>rcnw (replace a randomly chosen sequence of <digit (0-9)> consecutive nodes with wildcards
+                      * <digit>rccw (replace a randomly chosen sequence of <digit (0-9)> consecutive characters with wildcards
+                    example: {{.Name | patternCustom 15 "pass" 40 "1rcnw" 15 "2rcnw" 10 "3rcnw" 10 "3rccw" 10 "2rccw"}}\n
+     age:           subtracts the passed integer (typically .LastUpdate) from the query time
+     roundDuration: formats an integer-seconds duration using aggressive rounding. for the purpose of getting an idea of overal metrics age
 
 
-You may also use processing functions in templates:
-pattern: transforms a graphite.style.metric.name into a pattern with wildcards inserted
-age: subtracts the passed integer (typically .LastUpdate) from the query time
-roundDuration: formats an integer-seconds duration using aggressive rounding. for the purpose of getting an idea of overal metrics age
 EXAMPLES:
 mt-index-cat -from 60min cass -hosts cassandra:9042 list
 mt-index-cat -from 60min cass -hosts cassandra:9042 'sumSeries({{.Name | pattern}})'
 mt-index-cat -from 60min cass -hosts cassandra:9042 'GET http://localhost:6060/render?target=sumSeries({{.Name | pattern}})&from=-6h\nX-Org-Id: 1\n\n'
 mt-index-cat cass -hosts cassandra:9042 -timeout 60s '{{.LastUpdate | age | roundDuration}}\n' | sort | uniq -c
+mt-index-cat cass -hosts localhost:9042 -schema-file ../../scripts/config/schema-idx-cassandra.toml '{{.Name | patternCustom 15 "pass" 40 "1rcnw" 15 "2rcnw" 10 "3rcnw" 10 "3rccw" 10 "2rccw"}}\n'
 ```
 
 
@@ -162,8 +182,8 @@ Flags:
     	Address of cassandra host to migrate to. (default "localhost")
   -dst-keyspace string
     	Cassandra keyspace in use on destination. (default "raintank")
-  -log-level int
-    	log level. 0=TRACE|1=DEBUG|2=INFO|3=WARN|4=ERROR|5=CRITICAL|6=FATAL (default 2)
+  -log-level string
+    	log level. panic|fatal|error|warning|info|debug (default "info")
   -num-partitions int
     	number of partitions in cluster (default 1)
   -partition-scheme string
@@ -244,6 +264,31 @@ Flags:
 ```
 
 
+## mt-kafka-persist-sniff
+
+```
+mt-kafka-persist-sniff
+Print what's flowing through kafka metric persist topic
+
+Flags:
+
+  -backlog-process-timeout string
+    	Maximum time backlog processing can block during metrictank startup. Setting to a low value may result in data loss (default "60s")
+  -brokers string
+    	tcp address for kafka (may be given multiple times as comma separated list) (default "kafka:9092")
+  -enabled
+    	
+  -kafka-version string
+    	Kafka version in semver format. All brokers must be this version or newer. (default "0.10.0.0")
+  -offset string
+    	Set the offset to start consuming from. Can be oldest, newest or a time duration (default "newest")
+  -partitions string
+    	kafka partitions to consume. use '*' or a comma separated list of id's. This should match the partitions used for kafka-mdm-in (default "*")
+  -topic string
+    	kafka topic (default "metricpersist")
+```
+
+
 ## mt-schemas-explain
 
 ```
@@ -296,8 +341,8 @@ Flags:
     	how many times to retry a query before failing it
   -cassandra-ssl
     	enable SSL connection to cassandra
-  -cassandra-timeout int
-    	cassandra timeout in milliseconds (default 1000)
+  -cassandra-timeout string
+    	cassandra timeout (default "1s")
   -cassandra-username string
     	username for authentication (default "cassandra")
   -cql-protocol-version int
@@ -318,11 +363,12 @@ Usage:
 
 	mt-store-cat [flags] <table-selector> <metric-selector> <format>
 	                     table-selector: '*' or name of a table. e.g. 'metric_128'
-	                     metric-selector: '*' or an id (of raw or aggregated series) or prefix:<prefix>
+	                     metric-selector: '*' or an id (of raw or aggregated series) or prefix:<prefix> or substr:<substring> or glob:<pattern>
 	                     format:
 	                            - points
 	                            - point-summary
 	                            - chunk-summary (shows TTL's, optionally bucketed. See groupTTL flag)
+	                            - chunk-csv (for importing into cassandra)
 
 EXAMPLES:
 mt-store-cat -cassandra-keyspace metrictank -from='-1min' '*' '1.77c8c77afa22b67ef5b700c2a2b88d5f' points
@@ -330,6 +376,8 @@ mt-store-cat -cassandra-keyspace metrictank -from='-1month' '*' 'prefix:fake' po
 mt-store-cat -cassandra-keyspace metrictank '*' 'prefix:fake' chunk-summary
 mt-store-cat -groupTTL h -cassandra-keyspace metrictank 'metric_512' '1.37cf8e3731ee4c79063c1d55280d1bbe' chunk-summary
 Flags:
+  -archive string
+    	archive to fetch for given metric. e.g. 'sum_1800'
   -cassandra-addrs string
     	cassandra host (may be given multiple times as comma-separated list) (default "localhost")
   -cassandra-auth
@@ -348,8 +396,8 @@ Flags:
     	host (hostname and server cert) verification when using SSL (default true)
   -cassandra-keyspace string
     	cassandra keyspace to use for storing the metric data table (default "metrictank")
-  -cassandra-omit-read-timeout int
-    	if a read is older than this, it will directly be omitted without executing (default 60)
+  -cassandra-omit-read-timeout string
+    	if a read is older than this, it will directly be omitted without executing (default "60s")
   -cassandra-password string
     	password for authentication (default "cassandra")
   -cassandra-read-concurrency int
@@ -362,8 +410,8 @@ Flags:
     	File containing the needed schemas in case database needs initializing (default "/etc/metrictank/schema-store-cassandra.toml")
   -cassandra-ssl
     	enable SSL connection to cassandra
-  -cassandra-timeout int
-    	cassandra timeout in milliseconds (default 1000)
+  -cassandra-timeout string
+    	cassandra timeout (default "1s")
   -cassandra-username string
     	username for authentication (default "cassandra")
   -config string
@@ -371,63 +419,19 @@ Flags:
   -cql-protocol-version int
     	cql protocol version to use (default 4)
   -fix int
-    	fix data to this interval like metrictank does quantization. only for points and points-summary format
+    	fix data to this interval like metrictank does quantization. only for points and point-summary format
   -from string
-    	get data from (inclusive). only for points and points-summary format (default "-24h")
+    	get data from (inclusive). only for points and point-summary format (default "-24h")
   -groupTTL string
-    	group chunks in TTL buckets based on s (second. means unbucketed), m (minute), h (hour) or d (day). only for chunk-summary format (default "d")
+    	group chunks in TTL buckets: s (second. means unbucketed), m (minute), h (hour) or d (day). only for chunk-summary format (default "d")
   -print-ts
-    	print time stamps instead of formatted dates. only for points and poins-summary format
-  -test.bench regexp
-    	run only benchmarks matching regexp
-  -test.benchmem
-    	print memory allocations for benchmarks
-  -test.benchtime d
-    	run each benchmark for duration d (default 1s)
-  -test.blockprofile file
-    	write a goroutine blocking profile to file
-  -test.blockprofilerate rate
-    	set blocking profile rate (see runtime.SetBlockProfileRate) (default 1)
-  -test.count n
-    	run tests and benchmarks n times (default 1)
-  -test.coverprofile file
-    	write a coverage profile to file
-  -test.cpu list
-    	comma-separated list of cpu counts to run each test with
-  -test.cpuprofile file
-    	write a cpu profile to file
-  -test.failfast
-    	do not start new tests after the first test failure
-  -test.list regexp
-    	list tests, examples, and benchmarks matching regexp then exit
-  -test.memprofile file
-    	write a memory profile to file
-  -test.memprofilerate rate
-    	set memory profiling rate (see runtime.MemProfileRate)
-  -test.mutexprofile string
-    	write a mutex contention profile to the named file after execution
-  -test.mutexprofilefraction int
-    	if >= 0, calls runtime.SetMutexProfileFraction() (default 1)
-  -test.outputdir dir
-    	write profiles to dir
-  -test.parallel n
-    	run at most n tests in parallel (default num-processors)
-  -test.run regexp
-    	run only tests and examples matching regexp
-  -test.short
-    	run smaller test suite to save time
-  -test.testlogfile file
-    	write test action log to file (for use only by cmd/go)
-  -test.timeout d
-    	panic test binary after duration d (default 0, timeout disabled)
-  -test.trace file
-    	write an execution trace to file
-  -test.v
-    	verbose: print additional output
+    	print time stamps instead of formatted dates. only for points and point-summary format
   -time-zone string
     	time-zone to use for interpreting from/to when needed. (check your config) (default "local")
   -to string
-    	get data until (exclusive). only for points and points-summary format (default "now")
+    	get data until (exclusive). only for points and point-summary format (default "now")
+  -verbose
+    	verbose (print stuff about the request)
   -version
     	print version string
   -window-factor int
@@ -442,18 +446,17 @@ Notes:
 ```
 
 
-## mt-update-ttl
+## mt-store-cp-experimental
 
 ```
-mt-update-ttl [flags] ttl table-in [table-out]
+mt-store-cp [flags] table-in [table-out]
 
-Adjusts the data in Cassandra to use a new TTL value. The TTL is applied counting from the timestamp of the data
-If table-out not specified or same as table-in, will update in place. Otherwise will not touch input table and store results in table-out
-In that case, it is up to you to assure table-out exists before running this tool
-Not supported yet: for the per-ttl tables as of 0.7, automatically putting data in the right table
+Copies data in Cassandra to use another table (and possibly another cluster).
+It is up to you to assure table-out exists before running this tool
+This tool is EXPERIMENTAL and needs doublechecking whether data is successfully written to Cassandra
+see https://github.com/grafana/metrictank/pull/909 for details
+Please report good or bad experiences in the above ticket or in a new one
 Flags:
-  -cassandra-addrs string
-    	cassandra host (may be given multiple times as comma-separated list) (default "localhost")
   -cassandra-auth
     	enable cassandra authentication
   -cassandra-ca-path string
@@ -462,8 +465,8 @@ Flags:
     	max number of concurrent reads to cassandra. (default 20)
   -cassandra-consistency string
     	write consistency (any|one|two|three|quorum|all|local_quorum|each_quorum|local_one (default "one")
-  -cassandra-disable-initial-host-lookup
-    	instruct the driver to not attempt to get host info from the system.peers table
+  -cassandra-disable-host-lookup
+    	disable host lookup (useful if going through proxy)
   -cassandra-host-selection-policy string
     	 (default "tokenaware,hostpool-epsilon-greedy")
   -cassandra-host-verification
@@ -476,20 +479,94 @@ Flags:
     	how many times to retry a query before failing it
   -cassandra-ssl
     	enable SSL connection to cassandra
-  -cassandra-timeout int
-    	cassandra timeout in milliseconds (default 1000)
+  -cassandra-timeout string
+    	cassandra timeout (default "1s")
   -cassandra-username string
     	username for authentication (default "cassandra")
   -cql-protocol-version int
     	cql protocol version to use (default 4)
+  -dest-cassandra-addrs string
+    	cassandra host (may be given multiple times as comma-separated list) (default "localhost")
   -end-timestamp int
     	timestamp at which to stop, defaults to int max (default 2147483647)
+  -end-token int
+    	token to stop at (inclusive), defaults to math.MaxInt64 (default 9223372036854775807)
+  -idx-table string
+    	idx table in cassandra (default "metric_idx")
+  -max-batch-size int
+    	max number of queries per batch (default 10)
+  -partitions string
+    	process ids for these partitions (comma separated list of partition numbers or '*' for all) (default "*")
+  -progress-rows int
+    	number of rows between progress output (default 1000000)
+  -source-cassandra-addrs string
+    	cassandra host (may be given multiple times as comma-separated list) (default "localhost")
   -start-timestamp int
     	timestamp at which to start, defaults to 0
+  -start-token int
+    	token to start at (inclusive), defaults to math.MinInt64 (default -9223372036854775808)
   -threads int
     	number of workers to use to process data (default 1)
   -verbose
     	show every record being processed
+```
+
+
+## mt-update-ttl
+
+```
+mt-update-ttl [flags] ttl-old ttl-new
+
+Adjusts the data in Cassandra to use a new TTL value. The TTL is applied counting from the timestamp of the data
+Automatically resolves the corresponding tables based on ttl value.  If the table stays the same, will update in place. Otherwise will copy to the new table, not touching the input data
+Unless you disable create-keyspace, tables are created as needed
+Flags:
+  -cassandra-addrs string
+    	cassandra host (may be given multiple times as comma-separated list) (default "localhost")
+  -cassandra-auth
+    	enable cassandra authentication
+  -cassandra-ca-path string
+    	cassandra CA certificate path when using SSL (default "/etc/metrictank/ca.pem")
+  -cassandra-concurrency int
+    	number of concurrent connections to cassandra. (default 20)
+  -cassandra-consistency string
+    	write consistency (any|one|two|three|quorum|all|local_quorum|each_quorum|local_one (default "one")
+  -cassandra-disable-initial-host-lookup
+    	instruct the driver to not attempt to get host info from the system.peers table
+  -cassandra-host-verification
+    	host (hostname and server cert) verification when using SSL (default true)
+  -cassandra-keyspace string
+    	cassandra keyspace to use for storing the metric data table (default "metrictank")
+  -cassandra-password string
+    	password for authentication (default "cassandra")
+  -cassandra-retries int
+    	how many times to retry a query before failing it
+  -cassandra-ssl
+    	enable SSL connection to cassandra
+  -cassandra-timeout string
+    	cassandra timeout (default "1s")
+  -cassandra-username string
+    	username for authentication (default "cassandra")
+  -cql-protocol-version int
+    	cql protocol version to use (default 4)
+  -create-keyspace
+    	enable the creation of the keyspace and tables (default true)
+  -end-timestamp int
+    	timestamp at which to stop, defaults to int max (default 2147483647)
+  -host-selection-policy string
+    	 (default "tokenaware,hostpool-epsilon-greedy")
+  -schema-file string
+    	File containing the needed schemas in case database needs initializing (default "/etc/metrictank/schema-store-cassandra.toml")
+  -start-timestamp int
+    	timestamp at which to start, defaults to 0
+  -status-every int
+    	print status every x keys (default 100000)
+  -threads int
+    	number of workers to use to process data (default 10)
+  -verbose
+    	show every record being processed
+  -window-factor int
+    	size of compaction window relative to TTL (default 20)
 ```
 
 
@@ -574,8 +651,8 @@ global config flags:
     	host (hostname and server cert) verification when using SSL (default true)
   -cassandra-keyspace string
     	cassandra keyspace to use for storing the metric data table (default "metrictank")
-  -cassandra-omit-read-timeout int
-    	if a read is older than this, it will directly be omitted without executing (default 60)
+  -cassandra-omit-read-timeout string
+    	if a read is older than this, it will directly be omitted without executing (default "60s")
   -cassandra-password string
     	password for authentication (default "cassandra")
   -cassandra-read-concurrency int
@@ -588,8 +665,8 @@ global config flags:
     	File containing the needed schemas in case database needs initializing (default "/etc/metrictank/schema-store-cassandra.toml")
   -cassandra-ssl
     	enable SSL connection to cassandra
-  -cassandra-timeout int
-    	cassandra timeout in milliseconds (default 1000)
+  -cassandra-timeout string
+    	cassandra timeout (default "1s")
   -cassandra-username string
     	username for authentication (default "cassandra")
   -cassandra-window-factor int
@@ -637,8 +714,6 @@ cass config flags:
     	comma separated list of cassandra addresses in host:port form (default "localhost:9042")
   -keyspace string
     	Cassandra keyspace to store metricDefinitions in. (default "metrictank")
-  -max-stale duration
-    	clear series from the index if they have not been seen for this much time.
   -num-conns int
     	number of concurrent connections to cassandra (default 10)
   -password string

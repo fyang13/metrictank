@@ -2,8 +2,8 @@ package chaos_cluster
 
 import (
 	"context"
+	"flag"
 	"fmt"
-	"log"
 	"os"
 	"os/exec"
 	"reflect"
@@ -11,11 +11,13 @@ import (
 	"time"
 
 	"github.com/davecgh/go-spew/spew"
+	"github.com/grafana/metrictank/logger"
 	"github.com/grafana/metrictank/stacktest/docker"
 	"github.com/grafana/metrictank/stacktest/fakemetrics"
 	"github.com/grafana/metrictank/stacktest/grafana"
 	"github.com/grafana/metrictank/stacktest/graphite"
 	"github.com/grafana/metrictank/stacktest/track"
+	log "github.com/sirupsen/logrus"
 )
 
 // TODO: cleanup when ctrl-C go test (teardown all containers)
@@ -25,7 +27,18 @@ const numPartitions = 12
 var tracker *track.Tracker
 var fm *fakemetrics.FakeMetrics
 
+func init() {
+	formatter := &logger.TextFormatter{}
+	formatter.TimestampFormat = "2006-01-02 15:04:05.000"
+	log.SetFormatter(formatter)
+	log.SetLevel(log.InfoLevel)
+}
 func TestMain(m *testing.M) {
+	flag.Parse()
+	if testing.Short() {
+		fmt.Println("skipping chaos cluster test in short mode")
+		return
+	}
 	ctx, cancelFunc := context.WithCancel(context.Background())
 
 	fmt.Println("stopping docker-chaos stack should it be running...")
@@ -33,21 +46,21 @@ func TestMain(m *testing.M) {
 	cmd.Dir = docker.Path("docker/docker-chaos")
 	err := cmd.Start()
 	if err != nil {
-		log.Fatal(err)
+		log.Fatal(err.Error())
 	}
 
 	fmt.Println("launching docker-chaos stack...")
-	cmd = exec.CommandContext(ctx, docker.Path("docker/launch.sh"), "docker-chaos")
+	cmd = exec.CommandContext(ctx, "docker-compose", "up", "--force-recreate", "-V")
 	cmd.Env = append(cmd.Env, "MT_CLUSTER_MIN_AVAILABLE_SHARDS=12")
 
 	tracker, err = track.NewTracker(cmd, false, false, "launch-stdout", "launch-stderr")
 	if err != nil {
-		log.Fatal(err)
+		log.Fatal(err.Error())
 	}
 
 	err = cmd.Start()
 	if err != nil {
-		log.Fatal(err)
+		log.Fatal(err.Error())
 	}
 
 	retcode := m.Run()

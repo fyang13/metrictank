@@ -16,7 +16,7 @@ import (
 	"github.com/grafana/metrictank/mdata/cache/accnt"
 	"github.com/grafana/metrictank/mdata/chunk"
 	"github.com/grafana/metrictank/test"
-	"gopkg.in/raintank/schema.v1"
+	"github.com/raintank/schema"
 )
 
 func init() {
@@ -344,7 +344,7 @@ func TestGetSeriesFixed(t *testing.T) {
 	store.Drop = true
 
 	mdata.SetSingleAgg(conf.Avg, conf.Min, conf.Max)
-	mdata.SetSingleSchema(conf.NewRetentionMT(10, 100, 600, 10, true))
+	mdata.SetSingleSchema(conf.NewRetentionMT(10, 100, 600, 10, 0))
 
 	metrics := mdata.NewAggMetrics(store, &cache.MockCache{}, false, 0, 0, 0)
 	srv, _ := NewServer()
@@ -461,7 +461,7 @@ func generateChunks(span uint32, start uint32, end uint32) []chunk.Chunk {
 		}
 	}
 	// if end was not quantized we have to finish the last chunk
-	if !c.Closed {
+	if !c.Series.Finished {
 		c.Finish()
 		chunks = append(chunks, *c)
 	}
@@ -553,15 +553,18 @@ func TestGetSeriesCachedStore(t *testing.T) {
 				// populate cache and store according to pattern definition
 				var prevts uint32
 				for i := 0; i < len(tc.Pattern); i++ {
-					itgen := chunk.NewBareIterGen(chunks[i].Series.Bytes(), chunks[i].Series.T0, span)
+					itgen, err := chunk.NewIterGen(chunks[i].Series.T0, 0, chunks[i].Encode(span))
+					if err != nil {
+						t.Fatalf("NewIterGen error: %s", err)
+					}
 					if pattern[i] == 'c' || pattern[i] == 'b' {
-						c.Add(metric, prevts, *itgen)
+						c.Add(metric, prevts, itgen)
 					}
 					if pattern[i] == 's' || pattern[i] == 'b' {
 						cwr := mdata.NewChunkWriteRequest(nil, metric, &chunks[i], 0, span, time.Now())
 						store.Add(&cwr)
 					}
-					prevts = chunks[i].T0
+					prevts = chunks[i].Series.T0
 				}
 
 				// create a request for the current range
