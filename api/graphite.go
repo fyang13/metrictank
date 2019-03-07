@@ -377,7 +377,6 @@ func (s *Server) metricsIndex(ctx *middleware.Context) {
 		return
 	default:
 	}
-
 	response.Write(ctx, response.NewFastJson(200, models.MetricNames(series)))
 }
 
@@ -581,13 +580,16 @@ func (s *Server) metricsDeleteRemote(ctx context.Context, orgId uint32, query st
 
 // executePlan looks up the needed data, retrieves it, and then invokes the processing
 // note if you do something like sum(foo.*) and all of those metrics happen to be on another node,
-// we will collect all the indidividual series from the peer, and then sum here. that could be optimized
+// we will collect all the individual series from the peer, and then sum here. that could be optimized
 func (s *Server) executePlan(ctx context.Context, orgId uint32, plan expr.Plan) ([]models.Series, error) {
 
+	preExecutePlan := time.Now()
 	minFrom := uint32(math.MaxUint32)
 	var maxTo uint32
 	var reqs []models.Req
+	stats := make(map[string]float64)
 
+	preGetSeries := time.Now()
 	// note that different patterns to query can have different from / to, so they require different index lookups
 	// e.g. target=movingAvg(foo.*, "1h")&target=foo.*
 	// note that in this case we fetch foo.* twice. can be optimized later
@@ -642,15 +644,17 @@ func (s *Server) executePlan(ctx context.Context, orgId uint32, plan expr.Plan) 
 			}
 		}
 	}
-
+	stats["getSeriesTime"] = util.MsSince(preGetSeries)
 	select {
 	case <-ctx.Done():
 		//request canceled
 		return nil, nil
 	default:
 	}
+	num_series_req := len(reqs)
+	reqRenderSeriesCount.Value(num_series_req)
+	stats["seriesFetched"] = float64(num_series_req)
 
-	reqRenderSeriesCount.Value(len(reqs))
 	if len(reqs) == 0 {
 		return nil, nil
 	}
@@ -661,6 +665,8 @@ func (s *Server) executePlan(ctx context.Context, orgId uint32, plan expr.Plan) 
 		log.Errorf("HTTP Render alignReq error: %s", err.Error())
 		return nil, err
 	}
+	stats["pointsFetched"] = float64(pointsFetch)
+	stats["pointsReturned"] = float64(pointsReturn)
 	span := opentracing.SpanFromContext(ctx)
 	span.SetTag("num_reqs", len(reqs))
 	span.SetTag("points_fetch", pointsFetch)
@@ -670,11 +676,15 @@ func (s *Server) executePlan(ctx context.Context, orgId uint32, plan expr.Plan) 
 		log.Debugf("HTTP Render %s - arch:%d archI:%d outI:%d aggN: %d from %s", req, req.Archive, req.ArchInterval, req.OutInterval, req.AggNum, req.Node.GetName())
 	}
 
+	preGetTargets := time.Now()
 	out, err := s.getTargets(ctx, reqs)
+	stats["getTargetsTime"] = util.MsSince(preGetTargets)
 	if err != nil {
 		log.Errorf("HTTP Render %s", err.Error())
 		return nil, err
 	}
+
+	preRunLogic := time.Now()
 
 	out = mergeSeries(out)
 
@@ -691,10 +701,17 @@ func (s *Server) executePlan(ctx context.Context, orgId uint32, plan expr.Plan) 
 	for k := range data {
 		sort.Sort(models.SeriesByTarget(data[k]))
 	}
+	stats["preRunLogicTime"] = util.MsSince(preRunLogic)
 
 	preRun := time.Now()
 	out, err = plan.Run(data)
 	planRunDuration.Value(time.Since(preRun))
+	stats["planRunTime"] = util.MsSince(preRun)
+	stats["executePlanTime"] = util.MsSince(preExecutePlan)
+	for i,_ := range out {
+		out[i].Stats = stats
+	}
+
 	return out, err
 }
 
