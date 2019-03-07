@@ -404,37 +404,48 @@ func TestMergeSeries(t *testing.T) {
 		out = append(out, models.Series{
 			Target: fmt.Sprintf("some.series.foo%d", i),
 			Datapoints: []schema.Point{
-				{Val: math.NaN(), Ts: 1449178131},
-				{Val: math.NaN(), Ts: 1449178141},
-				{Val: 3, Ts: 1449178151},
-				{Val: 4, Ts: 1449178161},
+				{Val: math.NaN(), Ts: 1449178130},
+				{Val: math.NaN(), Ts: 1449178140},
+				{Val: 3, Ts: 1449178150},
+				{Val: 4, Ts: 1449178160},
+				{Val: 5, Ts: 1449178170},
+				{Val: 6, Ts: 1449178180},
 			},
-			Interval: 10,
+			QueryFrom: 1449178130,
+			QueryTo:   1449178180,
+			Interval:  10,
 		})
 	}
 	out = append(out, models.Series{
 		Target: "some.series.foo1",
 		Datapoints: []schema.Point{
-			{Val: 1, Ts: 1449178131},
-			{Val: 2, Ts: 1449178141},
-			{Val: math.NaN(), Ts: 1449178151},
-			{Val: math.NaN(), Ts: 1449178161},
+			{Val: 1, Ts: 1449178130},
+			{Val: 2, Ts: 1449178140},
+			{Val: math.NaN(), Ts: 1449178150},
+			{Val: math.NaN(), Ts: 1449178160},
+			{Val: 101, Ts: 1449178170},
 		},
-		Interval: 10,
+		QueryFrom: 1449178130,
+		QueryTo:   1449178180,
+		Interval:  10,
 	})
 
 	merged := mergeSeries(out)
 	if len(merged) != 5 {
 		t.Errorf("Expected data to be merged down to 5 series. got %d instead", len(merged))
 	}
+
 	for _, serie := range merged {
 		if serie.Target == "some.series.foo1" {
-			if len(serie.Datapoints) != 4 {
-				t.Errorf("expected 4 datapoints. got %d", len(serie.Datapoints))
+			if len(serie.Datapoints) != 5 {
+				t.Errorf("expected 5 datapoints. got %d", len(serie.Datapoints))
 			}
-			for _, pt := range serie.Datapoints {
+			for v, pt := range serie.Datapoints {
 				if math.IsNaN(pt.Val) {
 					t.Errorf("merging should have removed NaN values.")
+				}
+				if float64(v+1) != pt.Val {
+					t.Errorf("Expected to have series 1 override series 2: val1 = %d, val2 = %f", v+1, pt.Val)
 				}
 			}
 
