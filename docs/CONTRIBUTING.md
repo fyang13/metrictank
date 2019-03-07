@@ -10,7 +10,8 @@ Thanks for your interest in contributing to metrictank!
 
 * `make bin`: for building all binaries.
 * `make docker`: for building docker image (after building binaries)
-* `make test`: unit tests
+* `make test`: unit tests excluding expensive integration tests (faster)
+* `make test-all`: unit tests including expensive integration tests (slower)
 * `make qa`: run all QA (code quality) tests, same as CirceCI qa checks except CI also runs stack tests.
 
 see the [Makefile](../Makefile) for more targets
@@ -41,9 +42,23 @@ see the [Makefile](../Makefile) for more targets
     * first a structure, then its constructor, and then its methods
 13. Documentation in the [docs](../docs) folder should be kept in sync with current state of affairs
 14. HTTP status codes: use the [named codes defined in the standard library](https://golang.org/pkg/net/http/#pkg-constants) for easy searchability
+15. Don't rely on `.String()` being called implicitly, instead write the call out. This is to prevent that adding a `.Error()` method to structs can unexpectedly change the printed values.
 
 # Documentation
 
 * [docs](../docs) for users, operators and basic development instructions
 * [devdocs](../devdocs) in-depth implementation details for developers
 
+# Release process
+
+During normal development, maintain CHANGELOG.md, and mark interesting - to users and operators - changes under "unreleased" version.
+* Include: external API changes, performance improvements, features, anything affecting operations, etc.
+* Exclude: internal API changes, code refactorings/clean-ups, changes to the build process, etc. People interested in these have the git history.
+
+Grafana Labs regularly deploys the latest code from `master`, but cannot possibly do extensive testing of all functionality in production, so users are encouraged to run master also, and report any issues they hit.
+When significant changes have been merged to master, and they have had a chance to be tested or run in production for a while, we tag a release, as follows:
+
+* update CHANGELOG.md from `unreleased` to the version.
+* create annotated git tag in the form `v<version>` and push to GitHub
+* wait for CircleCI to complete successfully.
+* create release on GitHub. copy entry from CHANGELOG.md to GitHub release page

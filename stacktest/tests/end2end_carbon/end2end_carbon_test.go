@@ -1,6 +1,8 @@
 package end2end_carbon
 
 import (
+	"flag"
+	"fmt"
 	"os"
 	"os/exec"
 	"syscall"
@@ -31,6 +33,11 @@ func init() {
 	log.SetLevel(log.InfoLevel)
 }
 func TestMain(m *testing.M) {
+	flag.Parse()
+	if testing.Short() {
+		fmt.Println("skipping end2end carbon test (cassandra) in short mode")
+		return
+	}
 	log.Println("launching docker-dev stack...")
 	version := exec.Command("docker-compose", "version")
 	output, err := version.CombinedOutput()
@@ -86,7 +93,7 @@ func TestStartup(t *testing.T) {
 	case <-tracker.Match(matchers):
 		log.Println("stack now running.")
 		log.Println("Go to http://localhost:3000 (and login as admin:admin) to see what's going on")
-	case <-time.After(time.Second * 70):
+	case <-time.After(time.Second * 100):
 		grafana.PostAnnotation("TestStartup:FAIL")
 		t.Fatal("timed out while waiting for all metrictank instances to come up")
 	}

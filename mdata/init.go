@@ -7,11 +7,11 @@ import (
 	"flag"
 	"io/ioutil"
 
+	"github.com/grafana/globalconf"
 	"github.com/grafana/metrictank/conf"
 	"github.com/grafana/metrictank/stats"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
-	"github.com/rakyll/globalconf"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -38,6 +38,9 @@ var (
 	// your (infrequent) updates.  Any points revcieved for a chunk that has already been closed are discarded.
 	addToClosedChunk = stats.NewCounterRate32("tank.add_to_closed_chunk")
 
+	// metric tank.total_points is the number of points currently held in the in-memory ringbuffer
+	totalPoints = stats.NewGauge64("tank.total_points")
+
 	// metric mem.to_iter is how long it takes to transform in-memory chunks to iterators
 	memToIterDuration = stats.NewLatencyHistogram15s32("mem.to_iter")
 
@@ -60,24 +63,24 @@ var (
 	badAggSpan = stats.NewCounter32("recovered_errors.aggmetric.getaggregated.bad-aggspan")
 
 	// set either via ConfigProcess or from the unit tests. other code should not touch
-	Schemas      conf.Schemas
 	Aggregations conf.Aggregations
+	Schemas      conf.Schemas
 
 	schemasFile = "/etc/metrictank/storage-schemas.conf"
 	aggFile     = "/etc/metrictank/storage-aggregation.conf"
 
-	promActiveMetrics = promauto.NewGauge(prometheus.GaugeOpts{
+	promActiveMetrics = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Namespace: "metrictank",
 		Name:      "metrics_active",
 		Help:      "Current # of active metrics",
-	})
+	}, []string{"org"})
 )
 
 func ConfigSetup() {
 	retentionConf := flag.NewFlagSet("retention", flag.ExitOnError)
 	retentionConf.StringVar(&schemasFile, "schemas-file", "/etc/metrictank/storage-schemas.conf", "path to storage-schemas.conf file")
 	retentionConf.StringVar(&aggFile, "aggregations-file", "/etc/metrictank/storage-aggregation.conf", "path to storage-aggregation.conf file")
-	globalconf.Register("retention", retentionConf)
+	globalconf.Register("retention", retentionConf, flag.ExitOnError)
 }
 
 func ConfigProcess() {

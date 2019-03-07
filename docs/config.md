@@ -3,6 +3,7 @@
 Metrictank comes with an [example main config file](https://github.com/grafana/metrictank/blob/master/metrictank-sample.ini),
 a [storage-schemas.conf file](https://github.com/grafana/metrictank/blob/master/scripts/config/storage-schemas.conf) and
 a [storage-aggregation.conf file](https://github.com/grafana/metrictank/blob/master/scripts/config/storage-aggregation.conf)
+an [index-rules.conf file](https://github.com/grafana/metrictank/blob/master/scripts/config/index-rules.conf)
 
 The files themselves are well documented, but for your convenience, they are replicated below.  
 
@@ -13,7 +14,7 @@ Settings within section names in the config just require you to prefix the secti
 Examples:
 
 ```
-MT_LOG_LEVEL: 1                           # MT_<setting_name>
+MT_LOG_LEVEL: info                        # MT_<setting_name>
 MT_CASSANDRA_WRITE_CONCURRENCY: 10        # MT_<setting_name>
 MT_KAFKA_MDM_IN_DATA_DIR: /your/data/dir  # MT_<section_title>_<setting_name>
 ```
@@ -42,7 +43,7 @@ drop-first-chunk = false
 # max age for a chunk before to be considered stale and to be persisted to Cassandra
 chunk-max-stale = 1h
 # max age for a metric before to be considered stale and to be purged from in-memory ring buffer.
-metric-max-stale = 6h
+metric-max-stale = 3h
 # Interval to run garbage collection job
 gc-interval = 1h
 # duration before secondary nodes start serving requests
@@ -78,6 +79,8 @@ tracing-enabled = false
 tracing-addr = localhost:6831
 # tracer/process-level tags to include, specified as comma-separated key:value pairs
 tracing-add-tags =
+# Ratio of traces to sample between 0 (none) and 1 (all)
+tracing-sample-ratio = 1.0
 ```
 
 ## metric data storage in cassandra ##
@@ -85,6 +88,8 @@ tracing-add-tags =
 ```
 [cassandra]
 # see https://github.com/grafana/metrictank/blob/master/docs/cassandra.md for more details
+# enable the cassandra backend store plugin
+enabled = true
 # comma-separated list of hostnames to connect to
 addrs = localhost
 # keyspace to use for storing the metric data table
@@ -137,6 +142,36 @@ password = cassandra
 disable-initial-host-lookup = false
 ```
 
+## Bigtable backend Store Settings ##
+
+```
+[bigtable-store]
+# enable the bigtable backend store plugin
+enabled = false
+# Name of GCP project the bigtable cluster resides in
+gcp-project = default
+# Name of bigtable instance
+bigtable-instance = default
+# Name of bigtable table used for chunks
+table-name = metrics
+# Max number of chunks, per write thread, allowed to be unwritten to bigtable. Must be larger then write-max-flush-size
+write-queue-size = 100000
+# Max number of chunks in each batch write to bigtable
+write-max-flush-size = 10000
+# Number of writer threads to use
+write-concurrency = 10
+# Number concurrent reads that can be processed
+read-concurrency = 20
+# Maximum chunkspan size used.
+max-chunkspan = 6h
+# read timeout
+read-timeout = 5s
+# write timeout
+write-timeout = 5s
+# enable the creation of the table and column families
+create-cf = true
+```
+
 ## Retention settings ##
 
 ```
@@ -162,6 +197,8 @@ prefix = metrictank.stats.default.$instance
 addr = localhost:2003
 # interval at which to send statistics
 interval = 1
+# timeout after which a write is considered not successful
+timeout = 10s
 # how many messages (holding all measurements from one interval. rule of thumb: a message is ~25kB) to buffer up in case graphite endpoint is unavailable.
 # With the default of 20k you will use max about 500MB and bridge 5 hours of downtime when needed
 buffer-size = 20000
@@ -194,6 +231,8 @@ key-file = /etc/ssl/private/ssl-cert-snakeoil.key
 max-points-per-req-soft = 1000000
 # limit of number of datapoints a request can return. Requests that exceed this limit will be rejected. (0 disables limit)
 max-points-per-req-hard = 20000000
+# limit of number of series a request can operate on. Requests that exceed this limit will be rejected. (0 disables limit)
+max-series-per-req = 250000
 # require x-org-id authentication to auth as a specific org. otherwise orgId 1 is assumed
 multi-tenant = true
 # in case our /render endpoint does not support the requested processing, proxy the request to this graphite
@@ -242,19 +281,16 @@ enabled = false
 org-id = 0
 # tcp address (may be given multiple times as a comma-separated list)
 brokers = kafka:9092
+# Kafka version in semver format. All brokers must be this version or newer.
+kafka-version = 0.10.0.0
 # kafka topic (may be given multiple times as a comma-separated list)
 topics = mdm
-# offset to start consuming from. Can be one of newest, oldest,last or a time duration
+# offset to start consuming from. Can be oldest, newest or a time duration
 # When using a duration but the offset request fails (e.g. Kafka doesn't have data so far back), metrictank falls back to `oldest`.
 # the further back in time you go, the more old data you can load into metrictank, but the longer it takes to catch up to realtime data
-offset = last
+offset = newest
 # kafka partitions to consume. use '*' or a comma separated list of id's
 partitions = *
-# save interval for offsets
-offset-commit-interval = 5s
-# directory to store partition offsets index. supports relative or absolute paths. empty means working dir.
-# it will be created (incl parent dirs) if not existing.
-data-dir =
 # The number of metrics to buffer in internal and external channels
 channel-buffer-size = 1000
 # The minimum number of message bytes to fetch in a request
@@ -288,6 +324,9 @@ mode = single
 min-available-shards = 0
 # How long to wait before aborting http requests to cluster peers and returning a http 503 service unavailable
 http-timeout = 60s
+# GOGC value to use when node is not ready.  Defaults to GOGC
+# you can use this to set a more aggressive, latency-inducing GC behavior when the node is initializing and hungry for extra memory
+# gc-percent-not-ready = 100
 ```
 
 ## SWIM clustering settings ##
@@ -306,6 +345,9 @@ http-timeout = 60s
 use-config = manual
 # binding TCP Address for UDP and TCP gossip (full ip/dns:port combo unlike memberlist.Config)
 bind-addr = 0.0.0.0:7946
+# advertised TCP address for UDP and TCP gossip (full ip/dns:port combo, or empty to use bind-addr)
+# Useful for traversing NAT such as from inside docker
+advertise-addr =
 # timeout for establishing a stream connection with peers for a full state sync, and for stream reads and writes
 tcp-timeout = 10s
 # number of nodes that will be asked to perform an indirect probe of a node in the case a direct probe fails
@@ -346,40 +388,18 @@ dns-config-path = /etc/resolv.conf
 enabled = false
 # tcp address (may be given multiple times as a comma-separated list)
 brokers = kafka:9092
+# Kafka version in semver format. All brokers must be this version or newer.
+kafka-version = 0.10.0.0
 # kafka topic (only one)
 topic = metricpersist
 # kafka partitions to consume. use '*' or a comma separated list of id's. Should match kafka-mdm-in's partitions.
 partitions = *
-# offset to start consuming from. Can be one of newest, oldest,last or a time duration
+# offset to start consuming from. Can be oldest, newest or a time duration
 # When using a duration but the offset request fails (e.g. Kafka doesn't have data so far back), metrictank falls back to `oldest`.
 # Should match your kafka-mdm-in setting
-offset = last
-# save interval for offsets
-offset-commit-interval = 5s
-# Maximum time backlog processing can block during metrictank startup.
+offset = newest
+# Maximum time backlog processing can block during metrictank startup. Setting to a low value may result in data loss
 backlog-process-timeout = 60s
-# directory to store partition offsets index. supports relative or absolute paths. empty means working dir.
-# it will be created (incl parent dirs) if not existing.
-data-dir =
-```
-
-### nsq as transport for clustering messages
-
-```
-[nsq-cluster]
-enabled = false
-# nsqd TCP address (may be given multiple times as comma-separated list)
-nsqd-tcp-address =
-# lookupd HTTP address (may be given multiple times as comma-separated list)
-lookupd-http-address =
-topic = metricpersist
-channel = tank
-# passthrough to nsq.Producer (may be given multiple times as comma-separated list, see http://godoc.org/github.com/nsqio/go-nsq#Config)")
-producer-opt =
-#passthrough to nsq.Consumer (may be given multiple times as comma-separated list, http://godoc.org/github.com/nsqio/go-nsq#Config)")
-consumer-opt =
-# max number of messages to allow in flight
-max-in-flight = 200
 ```
 
 ## metric metadata index ##
@@ -396,19 +416,17 @@ hosts = localhost:9042
 protocol-version = 4
 # write consistency (any|one|two|three|quorum|all|local_quorum|each_quorum|local_one
 consistency = one
-# cassandra request timeout
+# cassandra request timeout. valid time units are 'ns', 'us' (or 'µs'), 'ms', 's', 'm', 'h'
 timeout = 1s
 # number of concurrent connections to cassandra
 num-conns = 10
 # Max number of metricDefs allowed to be unwritten to cassandra
 write-queue-size = 100000
-#automatically clear series from the index if they have not been seen for this much time.
-max-stale = 0
-#Interval at which the index should be checked for stale series.
+#Interval at which the index should be checked for stale series. valid time units are 'ns', 'us' (or 'µs'), 'ms', 's', 'm', 'h'
 prune-interval = 3h
 # synchronize index changes to cassandra. not all your nodes need to do this.
 update-cassandra-index = true
-#frequency at which we should update flush changes to cassandra. only relevant if update-cassandra-index is true.
+#frequency at which we should update flush changes to cassandra. only relevant if update-cassandra-index is true. valid time units are 'ns', 'us' (or 'µs'), 'ms', 's', 'm', 'h'. Setting to '0s' will cause instant updates.
 update-interval = 4h
 # enable SSL connection to cassandra
 ssl = false
@@ -441,8 +459,76 @@ tag-support = false
 tag-query-workers = 50
 # size of regular expression cache in tag query evaluation
 match-cache-size = 1000
+# path to index-rules.conf file
+rules-file = /etc/metrictank/index-rules.conf
 # maximum duration each second a prune job can lock the index.
 max-prune-lock-time = 100ms
+```
+
+### Bigtable index
+
+```
+[bigtable-idx]
+enabled = false
+# Name of GCP project the bigtable cluster resides in
+gcp-project = default
+# Name of bigtable instance
+bigtable-instance = default
+# Name of bigtable table used for MetricDefs
+table-name = metric_idx
+# Max number of metricDefs allowed to be unwritten to bigtable. Must be larger then write-max-flush-size
+write-queue-size = 100000
+# Max number of metricDefs in each batch write to bigtable
+write-max-flush-size = 10000
+# Number of writer threads to use
+write-concurrency = 5
+# synchronize index changes to bigtable. not all your nodes need to do this.
+update-bigtable-index = true
+# frequency at which we should update the metricDef lastUpdate field, use 0s for instant updates
+update-interval = 3h
+# Interval at which the index should be checked for stale series.
+prune-interval = 3h
+# enable the creation of the table and column families
+create-cf = true
+```
+
+# index-rules.conf
+
+```
+# This config file controls when to prune metrics from the index
+# Note:
+# * This file is optional. If it is not present, we won't prune data
+# * Patterns are regexes matched on the metric name (including tags) and tried from top to bottom. First match wins.
+# * Anything not matched or resolving to max-stale=0 will not be pruned
+# * Patterns are unanchored regular expressions; add '^' or '$' to match the beginning or end of a pattern
+# * max-stale is a duration like 7d. if no new data has been seen for a metric during this time, it will be pruned
+# * Valid units are s/sec/secs/second/seconds, m/min/mins/minute/minutes, h/hour/hours, d/day/days, w/week/weeks, mon/month/months, y/year/years
+
+[default]
+pattern = 
+max-stale = 0
+```
+
+# storage-aggregation.conf
+
+```
+# This config file controls which summaries are created (using which consolidation functions) for your lower-precision archives, as defined in storage-schemas.conf
+# It is an extension of http://graphite.readthedocs.io/en/latest/config-carbon.html#storage-aggregation-conf
+# Note:
+# * This file is optional. If it is not present, we will use avg for everything
+# * Anything not matched also uses avg for everything
+# * xFilesFactor is not honored yet.  What it is in graphite is a floating point number between 0 and 1 specifying what fraction of the previous retention level's slots must have non-null values in order to aggregate to a non-null value. The default is 0.5.
+# * aggregationMethod specifies the functions used to aggregate values for the next retention level. Legal methods are avg/average, sum, min, max, and last. The default is average.
+# Unlike Graphite, you can specify multiple, as it is often handy to have different summaries available depending on what analysis you need to do.
+# When using multiple, the first one is used for reading.  In the future, we will add capabilities to select the different archives for reading.
+# * the settings configured when metrictank starts are what is applied. So you can enable or disable archives by restarting metrictank.
+#
+# see https://github.com/grafana/metrictank/blob/master/docs/consolidation.md for related info.
+
+[default]
+pattern = .*
+xFilesFactor = 0.1
+aggregationMethod = avg,min,max
 ```
 
 # storage-schemas.conf
@@ -488,8 +574,11 @@ max-prune-lock-time = 100ms
 # which may be a more effective method to cache data and alleviate workload for cassandra.
 # Defaults to 2
 #
-# ready: whether the archive is ready for querying.  This is useful if you recently introduced a new archive, but it's still being populated
-# so you rather query other archives, even if they don't have the retention to serve your queries
+# ready: whether, or as of what data timestamp, the archive is ready for querying.
+# This is useful if you recently introduced a new archive, but it's still being populated, so doesn't have the data metrictank might otherwise think there is
+# It supports two syntaxes:
+# * unix timestamp: the archive can be used for data as of this timestamp
+# * boolean: (legacy): whether or not the archive is completely ready or not ready at all.
 # Defaults to true
 #
 # Here's an example with multiple retentions:
@@ -504,28 +593,6 @@ max-prune-lock-time = 100ms
 pattern = .*
 retentions = 1s:35d:10min:7
 # reorderBuffer = 20
-```
-
-# storage-aggregation.conf
-
-```
-# This config file controls which summaries are created (using which consolidation functions) for your lower-precision archives, as defined in storage-schemas.conf
-# It is an extension of http://graphite.readthedocs.io/en/latest/config-carbon.html#storage-aggregation-conf
-# Note:
-# * This file is optional. If it is not present, we will use avg for everything
-# * Anything not matched also uses avg for everything
-# * xFilesFactor is not honored yet.  What it is in graphite is a floating point number between 0 and 1 specifying what fraction of the previous retention level's slots must have non-null values in order to aggregate to a non-null value. The default is 0.5.
-# * aggregationMethod specifies the functions used to aggregate values for the next retention level. Legal methods are avg/average, sum, min, max, and last. The default is average.
-# Unlike Graphite, you can specify multiple, as it is often handy to have different summaries available depending on what analysis you need to do.
-# When using multiple, the first one is used for reading.  In the future, we will add capabilities to select the different archives for reading.
-# * the settings configured when metrictank starts are what is applied. So you can enable or disable archives by restarting metrictank.
-#
-# see https://github.com/grafana/metrictank/blob/master/docs/consolidation.md for related info.
-
-[default]
-pattern = .*
-xFilesFactor = 0.1
-aggregationMethod = avg,min,max
 ```
 
 This file is generated by [config-to-doc](https://github.com/grafana/metrictank/blob/master/scripts/dev/config-to-doc.sh)

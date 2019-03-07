@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"math"
 	"os"
-	"time"
 
 	"github.com/grafana/metrictank/api"
 	"github.com/grafana/metrictank/mdata/chunk"
@@ -13,7 +12,8 @@ import (
 	"github.com/raintank/schema"
 )
 
-func points(ctx context.Context, store *cassandra.CassandraStore, tables []cassandra.Table, metrics []Metric, fromUnix, toUnix, fix uint32) {
+// printPoints prints points in the store corresponding to the given requirements
+func printPoints(ctx context.Context, store *cassandra.CassandraStore, tables []cassandra.Table, metrics []Metric, fromUnix, toUnix, fix uint32) {
 	for _, metric := range metrics {
 		fmt.Println("## Metric", metric)
 		for _, table := range tables {
@@ -32,7 +32,8 @@ func points(ctx context.Context, store *cassandra.CassandraStore, tables []cassa
 	}
 }
 
-func pointSummary(ctx context.Context, store *cassandra.CassandraStore, tables []cassandra.Table, metrics []Metric, fromUnix, toUnix, fix uint32) {
+// printPointSummary prints a summarized view of the points in the store corresponding to the given requirements
+func printPointSummary(ctx context.Context, store *cassandra.CassandraStore, tables []cassandra.Table, metrics []Metric, fromUnix, toUnix, fix uint32) {
 	for _, metric := range metrics {
 		fmt.Println("## Metric", metric)
 		for _, table := range tables {
@@ -77,7 +78,7 @@ func getSeries(ctx context.Context, store *cassandra.CassandraStore, table cassa
 func printNormal(igens []chunk.IterGen, from, to uint32) {
 	fmt.Println("number of chunks:", len(igens))
 	for i, ig := range igens {
-		fmt.Printf("#### chunk %d (span %d)\n", i, ig.Span)
+		fmt.Printf("#### chunk %d (t0:%s, span:%d, format:%s, size:%d)\n", i, printTime(ig.T0), ig.Span(), ig.Format(), ig.Size())
 		iter, err := ig.Get()
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "chunk %d itergen.Get: %s", i, err)
@@ -98,25 +99,14 @@ func printPointsNormal(points []schema.Point, from, to uint32) {
 }
 
 func printRecord(ts uint32, val float64, in, nan bool) {
-	printTime := func(ts uint32) string {
-		if *printTs {
-			return fmt.Sprintf("%d", ts)
-		} else {
-			return time.Unix(int64(ts), 0).Format(tsFormat)
-		}
-	}
+	prefix := "- "
 	if in {
-		if nan {
-			fmt.Println("> ", printTime(ts), "NAN")
-		} else {
-			fmt.Println("> ", printTime(ts), val)
-		}
+		prefix = "> "
+	}
+	if nan {
+		fmt.Println(prefix, printTime(ts), "NAN")
 	} else {
-		if nan {
-			fmt.Println("- ", printTime(ts), "NAN")
-		} else {
-			fmt.Println("- ", printTime(ts), val)
-		}
+		fmt.Println(prefix, printTime(ts), val)
 	}
 }
 

@@ -1,9 +1,7 @@
 package cassandra
 
 import (
-	"bytes"
 	"context"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"sort"
@@ -35,10 +33,10 @@ const Table_name_format = `metric_%d`
 var (
 	errChunkTooSmall = errors.New("impossibly small chunk in cassandra")
 	errInvalidRange  = errors.New("CassandraStore: invalid range: from must be less than to")
+	errCtxCanceled   = errors.New("context canceled")
 	errReadQueueFull = errors.New("the read queue is full")
 	errReadTooOld    = errors.New("the read is too old")
 	errTableNotFound = errors.New("table for given TTL not found")
-	errCtxCanceled   = errors.New("context canceled")
 
 	// metric store.cassandra.get.exec is the duration of getting from cassandra store
 	cassGetExecDuration = stats.NewLatencyHistogram15s32("store.cassandra.get.exec")
@@ -93,22 +91,6 @@ type CassandraStore struct {
 	timeout          time.Duration
 }
 
-func PrepareChunkData(span uint32, data []byte) []byte {
-	chunkSizeAtSave.Value(len(data))
-	version := chunk.FormatStandardGoTszWithSpan
-	buf := new(bytes.Buffer)
-	binary.Write(buf, binary.LittleEndian, version)
-
-	spanCode, ok := chunk.RevChunkSpans[span]
-	if !ok {
-		// it's probably better to panic than to persist the chunk with a wrong length
-		panic(fmt.Sprintf("Chunk span invalid: %d", span))
-	}
-	binary.Write(buf, binary.LittleEndian, spanCode)
-	buf.Write(data)
-	return buf.Bytes()
-}
-
 // ConvertTimeout provides backwards compatibility for values that used to be specified as integers,
 // while also allowing them to be specified as durations.
 func ConvertTimeout(timeout string, defaultUnit time.Duration) time.Duration {
@@ -123,6 +105,7 @@ func ConvertTimeout(timeout string, defaultUnit time.Duration) time.Duration {
 	return timeoutD
 }
 
+// NewCassandraStore creates a new cassandra store, using the provided retention ttl's in seconds
 func NewCassandraStore(config *StoreConfig, ttls []uint32) (*CassandraStore, error) {
 	stats.NewGauge32("store.cassandra.write_queue.size").Set(config.WriteQueueSize)
 	stats.NewGauge32("store.cassandra.num_writers").Set(config.WriteConcurrency)
@@ -194,7 +177,7 @@ func NewCassandraStore(config *StoreConfig, ttls []uint32) (*CassandraStore, err
 					if _, ok := keyspaceMetadata.Tables[table.Name]; !ok {
 						log.Warnf("cassandra table %s not found; attempt: %v", table.Name, attempt)
 						if attempt >= 5 {
-							return nil, err
+							return nil, fmt.Errorf("cassandra table %s not found after %d attempts", table.Name, attempt)
 						}
 						time.Sleep(5 * time.Second)
 						continue AttemptLoop
@@ -268,7 +251,9 @@ func NewCassandraStore(config *StoreConfig, ttls []uint32) (*CassandraStore, err
 // FindExistingTables set's the store's table definitions to what it can find
 // in the database.
 // WARNING:
-// * does not set windowFactor property, because we can't know what it was
+// * does not set the windowSize property, because we don't know what the windowFactor was
+//   we could actually figure it based on the table definition, assuming the schema isn't tampered with,
+//   but there is no use case for this so we haven't implemented this.
 // * each table covers a range of TTL's. we set the TTL to the lower limit
 //   so remember the TTL might have been up to twice as much
 func (c *CassandraStore) FindExistingTables(keyspace string) error {
@@ -327,22 +312,23 @@ func (c *CassandraStore) processWriteQueue(queue chan *mdata.ChunkWriteRequest, 
 			meter.Value(len(queue))
 		case cwr := <-queue:
 			meter.Value(len(queue))
-			log.Debugf("CS: starting to save %s:%d %v", cwr.Key, cwr.Chunk.T0, cwr.Chunk)
+			log.Debugf("CS: starting to save %s:%d %v", cwr.Key, cwr.Chunk.Series.T0, cwr.Chunk)
 			//log how long the chunk waited in the queue before we attempted to save to cassandra
 			cassPutWaitDuration.Value(time.Now().Sub(cwr.Timestamp))
 
-			buf := PrepareChunkData(cwr.Span, cwr.Chunk.Series.Bytes())
+			buf := cwr.Chunk.Encode(cwr.Span)
+			chunkSizeAtSave.Value(len(buf))
 			success := false
 			attempts := 0
 			keyStr := cwr.Key.String()
 			for !success {
-				err := c.insertChunk(keyStr, cwr.Chunk.T0, cwr.TTL, buf)
+				err := c.insertChunk(keyStr, cwr.Chunk.Series.T0, cwr.TTL, buf)
 
 				if err == nil {
 					success = true
-					cwr.Metric.SyncChunkSaveState(cwr.Chunk.T0)
-					mdata.SendPersistMessage(keyStr, cwr.Chunk.T0)
-					log.Debugf("CS: save complete. %s:%d %v", keyStr, cwr.Chunk.T0, cwr.Chunk)
+					cwr.Metric.SyncChunkSaveState(cwr.Chunk.Series.T0)
+					mdata.SendPersistMessage(keyStr, cwr.Chunk.Series.T0)
+					log.Debugf("CS: save complete. %s:%d %v", keyStr, cwr.Chunk.Series.T0, cwr.Chunk)
 					chunkSaveOk.Inc()
 				} else {
 					errmetrics.Inc(err)
@@ -447,16 +433,14 @@ func (c *CassandraStore) SearchTable(ctx context.Context, key schema.AMKey, tabl
 
 	pre := time.Now()
 
-	start_month := start - (start % Month_sec)       // starting row has to be at, or before, requested start
-	end_month := (end - 1) - ((end - 1) % Month_sec) // ending row has to include the last point we might need (end-1)
-
 	// unfortunately in the database we only have the t0's of all chunks.
 	// this means we can easily make sure to include the correct last chunk (just query for a t0 < end, the last chunk will contain the last needed data)
-	// but it becomes hard to find which should be the first chunk to include. we can't just query for start <= t0 because than will miss some data at the beginning
-	// we can't assume we know the chunkSpan so we can't just calculate the t0 >= start - <some-predefined-number> because chunkSpans may change over time.
+	// but it becomes hard to find which should be the first chunk to include. we can't just query for start <= t0 because then we will miss some data at
+	// the beginning. We can't assume we know the chunkSpan so we can't just calculate the t0 >= (start - <some-predefined-number>) because chunkSpans
+	// may change over time.
 	// we effectively need all chunks with a t0 > start, as well as the last chunk with a t0 <= start.
 	// since we make sure that you can only use chunkSpans so that Month_sec % chunkSpan == 0, we know that this previous chunk will always be in the same row
-	// as the one that has start_month.
+	// as startMonth
 
 	// For example:
 	// Month_sec = 60 * 60 * 24 * 28 = 2419200 (28 days)
@@ -476,8 +460,8 @@ func (c *CassandraStore) SearchTable(ctx context.Context, key schema.AMKey, tabl
 
 	// let's say query has start 5222000 and end 7555000
 	// so start is somewhere between 4-5, and end between 8-9
-	// start_month = 4838400 (row 1)
-	// end_month = 7257600 (row 2)
+	// startMonth = 5222000 / 2419200 = 2 (row 1)
+	// endMonth = 7554999 / 2419200 = 3 (row 2)
 	// how do we query for all the chunks we need and not many more? knowing that chunkspan is not known?
 	// for end, we can simply search for t0 < 7555000 in row 2, which gives us all chunks we need
 	// for start, the best we can do is search for t0 <= 5222000 in row 1
@@ -485,11 +469,11 @@ func (c *CassandraStore) SearchTable(ctx context.Context, key schema.AMKey, tabl
 
 	results := make(chan readResult, 1)
 
-	startMonthNum := start_month / Month_sec
-	endMonthNum := end_month / Month_sec
-	rowKeys := make([]string, endMonthNum-startMonthNum+1)
+	startMonth := start / Month_sec   // starting row has to be at, or before, requested start
+	endMonth := (end - 1) / Month_sec // ending row has to include the last point we might need (end-1)
+	rowKeys := make([]string, endMonth-startMonth+1)
 	i := 0
-	for num := startMonthNum; num <= endMonthNum; num += 1 {
+	for num := startMonth; num <= endMonth; num += 1 {
 		rowKeys[i] = fmt.Sprintf("%s_%d", key, num)
 		i++
 	}
@@ -535,22 +519,24 @@ func (c *CassandraStore) SearchTable(ctx context.Context, key schema.AMKey, tabl
 	cassGetChunksDuration.Value(time.Since(pre))
 	pre = time.Now()
 
+	intervalHint := key.Archive.Span()
+
 	var b []byte
-	var ts int
-	for res.i.Scan(&ts, &b) {
+	var t0 int
+	for res.i.Scan(&t0, &b) {
 		chunkSizeAtLoad.Value(len(b))
 		if len(b) < 2 {
 			tracing.Failure(span)
 			tracing.Error(span, errChunkTooSmall)
 			return itgens, errChunkTooSmall
 		}
-		itgen, err := chunk.NewGen(b, uint32(ts))
+		itgen, err := chunk.NewIterGen(uint32(t0), intervalHint, b)
 		if err != nil {
 			tracing.Failure(span)
 			tracing.Error(span, err)
 			return itgens, err
 		}
-		itgens = append(itgens, *itgen)
+		itgens = append(itgens, itgen)
 	}
 
 	err := res.i.Close()

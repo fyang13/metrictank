@@ -9,34 +9,36 @@ import (
 	"strings"
 	"time"
 
-	"github.com/raintank/schema"
-
+	"github.com/grafana/globalconf"
 	"github.com/grafana/metrictank/conf"
 	"github.com/grafana/metrictank/logger"
-	opentracing "github.com/opentracing/opentracing-go"
-	log "github.com/sirupsen/logrus"
-
 	"github.com/grafana/metrictank/store/cassandra"
+	opentracing "github.com/opentracing/opentracing-go"
 	"github.com/raintank/dur"
-	"github.com/rakyll/globalconf"
+	"github.com/raintank/schema"
+	log "github.com/sirupsen/logrus"
 )
 
 const tsFormat = "2006-01-02 15:04:05"
 
 var (
-	gitHash = "(none)"
+	version = "(none)"
 
 	// flags from metrictank.go, globals
 	showVersion = flag.Bool("version", false, "print version string")
 	confFile    = flag.String("config", "/etc/metrictank/metrictank.ini", "configuration file path")
 
 	// our own flags
-	from        = flag.String("from", "-24h", "get data from (inclusive). only for points and points-summary format")
-	to          = flag.String("to", "now", "get data until (exclusive). only for points and points-summary format")
-	fix         = flag.Int("fix", 0, "fix data to this interval like metrictank does quantization. only for points and points-summary format")
-	printTs     = flag.Bool("print-ts", false, "print time stamps instead of formatted dates. only for points and poins-summary format")
-	groupTTL    = flag.String("groupTTL", "d", "group chunks in TTL buckets based on s (second. means unbucketed), m (minute), h (hour) or d (day). only for chunk-summary format")
+	from        = flag.String("from", "-24h", "get data from (inclusive). only for points and point-summary format")
+	to          = flag.String("to", "now", "get data until (exclusive). only for points and point-summary format")
+	fix         = flag.Int("fix", 0, "fix data to this interval like metrictank does quantization. only for points and point-summary format")
+	printTs     = flag.Bool("print-ts", false, "print time stamps instead of formatted dates. only for points and point-summary format")
+	groupTTL    = flag.String("groupTTL", "d", "group chunks in TTL buckets: s (second. means unbucketed), m (minute), h (hour) or d (day). only for chunk-summary format")
 	timeZoneStr = flag.String("time-zone", "local", "time-zone to use for interpreting from/to when needed. (check your config)")
+	archiveStr  = flag.String("archive", "", "archive to fetch for given metric. e.g. 'sum_1800'")
+	verbose     bool
+
+	printTime func(ts uint32) string
 )
 
 func init() {
@@ -44,6 +46,7 @@ func init() {
 	formatter.TimestampFormat = "2006-01-02 15:04:05.000"
 	log.SetFormatter(formatter)
 	log.SetLevel(log.InfoLevel)
+	flag.BoolVar(&verbose, "verbose", false, "verbose (print stuff about the request)")
 }
 
 func main() {
@@ -83,11 +86,12 @@ func main() {
 		fmt.Println()
 		fmt.Printf("	mt-store-cat [flags] <table-selector> <metric-selector> <format>\n")
 		fmt.Printf("	                     table-selector: '*' or name of a table. e.g. 'metric_128'\n")
-		fmt.Printf("	                     metric-selector: '*' or an id (of raw or aggregated series) or prefix:<prefix>\n")
+		fmt.Printf("	                     metric-selector: '*' or an id (of raw or aggregated series) or prefix:<prefix> or substr:<substring> or glob:<pattern>\n")
 		fmt.Printf("	                     format:\n")
 		fmt.Printf("	                            - points\n")
 		fmt.Printf("	                            - point-summary\n")
 		fmt.Printf("	                            - chunk-summary (shows TTL's, optionally bucketed. See groupTTL flag)\n")
+		fmt.Printf("	                            - chunk-csv (for importing into cassandra)\n")
 		fmt.Println()
 		fmt.Println("EXAMPLES:")
 		fmt.Println("mt-store-cat -cassandra-keyspace metrictank -from='-1min' '*' '1.77c8c77afa22b67ef5b700c2a2b88d5f' points")
@@ -107,7 +111,7 @@ func main() {
 	flag.Parse()
 
 	if *showVersion {
-		fmt.Printf("mt-store-cat (built with %s, git hash %s)\n", runtime.Version(), gitHash)
+		fmt.Printf("mt-store-cat (version: %s - runtime: %s)\n", version, runtime.Version())
 		return
 	}
 	if flag.NArg() < 1 {
@@ -123,14 +127,13 @@ func main() {
 		}
 		metricSelector = flag.Arg(1)
 		format = flag.Arg(2)
-		if format != "points" && format != "point-summary" && format != "chunk-summary" {
+		if format != "points" && format != "point-summary" && format != "chunk-summary" && format != "chunk-csv" {
 			flag.Usage()
 			os.Exit(-1)
 		}
-		if metricSelector == "prefix:" {
-			log.Fatal("prefix cannot be empty")
+		if metricSelector == "prefix:" || metricSelector == "substr:" || metricSelector == "glob:" {
+			log.Fatal("prefix/substr/glob cannot be empty")
 		}
-
 	}
 
 	// Only try and parse the conf file if it exists
@@ -154,9 +157,9 @@ func main() {
 		os.Exit(1)
 	}
 
-	if *showVersion {
-		fmt.Printf("mt-store-cat (built with %s, git hash %s)\n", runtime.Version(), gitHash)
-		return
+	printTime = printTimeFormatted
+	if *printTs {
+		printTime = printTimeUnix
 	}
 
 	var loc *time.Location
@@ -175,7 +178,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("failed to initialize cassandra. %s", err.Error())
 	}
-	tracer, traceCloser, err := conf.GetTracer(false, "", nil)
+	tracer, traceCloser, err := conf.GetTracer(false, "", nil, 0.0)
 	if err != nil {
 		log.Fatalf("Could not initialize jaeger tracer: %s", err.Error())
 	}
@@ -187,16 +190,31 @@ func main() {
 		log.Fatalf("failed to read tables from cassandra. %s", err.Error())
 	}
 
-	if tableSelector == "tables" {
-		tables, err := getTables(store, "")
+	var archive schema.Archive
+	if *archiveStr != "" {
+		archive, err = schema.ArchiveFromString(*archiveStr)
 		if err != nil {
-			log.Fatal(err.Error())
+			log.Fatalf("could not parse archive %q: %s", *archiveStr, err)
 		}
-		for _, table := range tables {
-			fmt.Printf("%s (ttl %d hours)\n", table.Name, table.TTL)
-		}
+	}
+
+	// set up is done, now actually execute the business logic
+
+	// handle "tables"
+	if tableSelector == "tables" {
+		printTables(store)
 		return
 	}
+
+	// handle the case where we have a table-selector, metric-selector and format
+	// table-selector: '*' or name of a table. e.g. 'metric_128'
+	// metric-selector: '*' or an id (of raw or aggregated series) or prefix:<prefix> or substr:<substring> or glob:<pattern>
+	// format: points, point-summary, chunk-summary or chunk-csv
+
+	if format == "chunk-csv" && (tableSelector == "*" || tableSelector == "") {
+		log.Fatal("chunk-csv format can be used with 1 cassandra table only")
+	}
+
 	tables, err := getTables(store, tableSelector)
 	if err != nil {
 		log.Fatal(err.Error())
@@ -204,7 +222,7 @@ func main() {
 
 	var fromUnix, toUnix uint32
 
-	if format == "points" || format == "point-summary" {
+	if format == "points" || format == "point-summary" || format == "chunk-csv" {
 		now := time.Now()
 		defaultFrom := uint32(now.Add(-time.Duration(24) * time.Hour).Unix())
 		defaultTo := uint32(now.Add(time.Duration(1) * time.Second).Unix())
@@ -221,25 +239,41 @@ func main() {
 	}
 	var metrics []Metric
 	if metricSelector == "*" {
-		fmt.Println("# Looking for ALL metrics")
+		if verbose {
+			fmt.Println("# Looking for ALL metrics")
+		}
 		// chunk-summary doesn't need an explicit listing. it knows if metrics is empty, to query all
 		// but the other two do need an explicit listing.
 		if format == "points" || format == "point-summary" {
-			metrics, err = getMetrics(store, "")
+			metrics, err = getMetrics(store, "", "", "", archive)
 			if err != nil {
 				log.Errorf("cassandra query error. %s", err.Error())
 				return
 			}
 		}
-	} else if strings.HasPrefix(metricSelector, "prefix:") {
-		fmt.Println("# Looking for these metrics:")
-		metrics, err = getMetrics(store, strings.Replace(metricSelector, "prefix:", "", 1))
+	} else if strings.HasPrefix(metricSelector, "prefix:") || strings.HasPrefix(metricSelector, "substr:") || strings.HasPrefix(metricSelector, "glob:") {
+		var prefix, substr, glob string
+		if strings.HasPrefix(metricSelector, "prefix:") {
+			prefix = strings.Replace(metricSelector, "prefix:", "", 1)
+		}
+		if strings.HasPrefix(metricSelector, "substr:") {
+			substr = strings.Replace(metricSelector, "substr:", "", 1)
+		}
+		if strings.HasPrefix(metricSelector, "glob:") {
+			glob = strings.Replace(metricSelector, "glob:", "", 1)
+		}
+		if verbose {
+			fmt.Println("# Looking for these metrics:")
+		}
+		metrics, err = getMetrics(store, prefix, substr, glob, archive)
 		if err != nil {
 			log.Errorf("cassandra query error. %s", err.Error())
 			return
 		}
-		for _, m := range metrics {
-			fmt.Println(m)
+		if verbose {
+			for _, m := range metrics {
+				fmt.Println(m)
+			}
 		}
 	} else {
 		amkey, err := schema.AMKeyFromString(metricSelector)
@@ -248,7 +282,9 @@ func main() {
 			return
 		}
 
-		fmt.Println("# Looking for this metric:")
+		if verbose {
+			fmt.Println("# Looking for this metric:")
+		}
 
 		metrics, err = getMetric(store, amkey)
 		if err != nil {
@@ -256,25 +292,31 @@ func main() {
 			return
 		}
 		if len(metrics) == 0 {
-			fmt.Printf("metric id %v not found", amkey.MKey)
+			fmt.Printf("metric id %s not found", amkey.MKey.String())
 			return
 		}
-		for _, m := range metrics {
-			fmt.Println(m)
+		if verbose {
+			for _, m := range metrics {
+				fmt.Println(m)
+			}
 		}
 	}
 
-	fmt.Printf("# Keyspace %q:\n", storeConfig.Keyspace)
+	if verbose {
+		fmt.Printf("# Keyspace %q:\n", storeConfig.Keyspace)
+	}
 
 	span := tracer.StartSpan("mt-store-cat " + format)
 	ctx := opentracing.ContextWithSpan(context.Background(), span)
 
 	switch format {
 	case "points":
-		points(ctx, store, tables, metrics, fromUnix, toUnix, uint32(*fix))
+		printPoints(ctx, store, tables, metrics, fromUnix, toUnix, uint32(*fix))
 	case "point-summary":
-		pointSummary(ctx, store, tables, metrics, fromUnix, toUnix, uint32(*fix))
+		printPointSummary(ctx, store, tables, metrics, fromUnix, toUnix, uint32(*fix))
 	case "chunk-summary":
-		chunkSummary(ctx, store, tables, metrics, *groupTTL)
+		printChunkSummary(ctx, store, tables, metrics, *groupTTL)
+	case "chunk-csv":
+		printChunkCsv(ctx, store, tables[0], metrics, fromUnix, toUnix)
 	}
 }

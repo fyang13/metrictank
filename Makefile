@@ -2,7 +2,9 @@
 default:
 	$(MAKE) all
 test:
-	CGO_ENABLED=1 go test -race $(shell go list ./... | grep -v stacktest)
+	CGO_ENABLED=1 go test -race -short ./...
+test-all:
+	CGO_ENABLED=1 go test -race ./...
 check:
 	$(MAKE) test
 bin:
@@ -28,3 +30,7 @@ all:
 	$(MAKE) bin
 	$(MAKE) docker
 	$(MAKE) qa
+
+clean:
+	rm build/*
+	rm scripts/build/*

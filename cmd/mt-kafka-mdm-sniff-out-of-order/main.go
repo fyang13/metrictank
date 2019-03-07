@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"math/rand"
@@ -13,12 +14,12 @@ import (
 	"text/template"
 	"time"
 
+	"github.com/grafana/globalconf"
 	inKafkaMdm "github.com/grafana/metrictank/input/kafkamdm"
 	"github.com/grafana/metrictank/logger"
 	"github.com/grafana/metrictank/stats"
 	"github.com/raintank/schema"
 	"github.com/raintank/schema/msg"
-	"github.com/rakyll/globalconf"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -203,22 +204,20 @@ func main() {
 
 	// config may have had it disabled
 	inKafkaMdm.Enabled = true
-	// important: we don't want to share the same offset tracker as the mdm input of MT itself
-	inKafkaMdm.DataDir = "/tmp/" + instance
 
 	inKafkaMdm.ConfigProcess(instance)
 
 	stats.NewDevnull() // make sure metrics don't pile up without getting discarded
 
 	mdm := inKafkaMdm.New()
-	pluginFatal := make(chan struct{})
-	mdm.Start(newInputOOOFinder(*format), pluginFatal)
+	ctx, cancel := context.WithCancel(context.Background())
+	mdm.Start(newInputOOOFinder(*format), cancel)
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	select {
 	case sig := <-sigChan:
 		log.Infof("Received signal %q. Shutting down", sig)
-	case <-pluginFatal:
+	case <-ctx.Done():
 		log.Info("Mdm input plugin signalled a fatal error. Shutting down")
 	}
 	mdm.Stop()

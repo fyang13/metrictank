@@ -4,18 +4,19 @@ package carbon
 
 import (
 	"bufio"
+	"context"
 	"flag"
 	"io"
 	"net"
 	"strings"
 	"sync"
 
+	"github.com/grafana/globalconf"
 	"github.com/grafana/metrictank/cluster"
 	"github.com/grafana/metrictank/input"
 	"github.com/grafana/metrictank/stats"
 	"github.com/metrics20/go-metrics20/carbon20"
 	"github.com/raintank/schema"
-	"github.com/rakyll/globalconf"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -80,7 +81,7 @@ func ConfigSetup() {
 	inCarbon.BoolVar(&Enabled, "enabled", false, "")
 	inCarbon.StringVar(&addr, "addr", ":2003", "tcp listen address")
 	inCarbon.IntVar(&partitionId, "partition", 0, "partition Id.")
-	globalconf.Register("carbon-in", inCarbon)
+	globalconf.Register("carbon-in", inCarbon, flag.ExitOnError)
 }
 
 func ConfigProcess() {
@@ -106,7 +107,7 @@ func (c *Carbon) IntervalGetter(i IntervalGetter) {
 	c.intervalGetter = i
 }
 
-func (c *Carbon) Start(handler input.Handler, fatal chan struct{}) error {
+func (c *Carbon) Start(handler input.Handler, cancel context.CancelFunc) error {
 	c.Handler = handler
 	l, err := net.ListenTCP("tcp", c.addr)
 	if nil != err {

@@ -16,7 +16,23 @@ if [ "$1" != "-f" -a "$1" != "--force" ]; then
 	[ -n "$out" ] && echo "WARNING: working copy dirty. cannot accurately operate. skipping test" && exit 0
 fi
 
+
 go get -u golang.org/x/tools/cmd/stringer github.com/tinylib/msgp
+
+msgpRev=$(grep -A 3 'name = "github.com/tinylib/msgp"' Gopkg.lock | tr -d '"' | tr -s ' ' | grep revision | cut -d' ' -f4)
+if [ -z "$msgpRev" ]; then
+	echo "ERROR: failed to parse msgp revision from Gopkg.lock"
+	exit 2
+fi
+
+# lock the msgp tool to the same version as the vendored code, so the generated code is definitely compatible.
+# the generated code also tends to receive small tweaks over time, we wouldn't want our build to suddenly break
+# when that happens
+cd $gopath/src/github.com/tinylib/msgp
+git checkout $msgpRev
+go install
+
+cd -
 
 go generate ./...
 out=$(git status --short)

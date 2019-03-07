@@ -6,8 +6,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"net/http"
+	"os"
+	"runtime/debug"
+	"strconv"
 	"time"
 
 	"github.com/grafana/metrictank/tracing"
@@ -126,6 +130,72 @@ func (n HTTPNode) IsLocal() bool {
 	return n.local
 }
 
+// readyStateGCHandler adjusts the gcPercent value based on the node ready state
+func (n HTTPNode) readyStateGCHandler() {
+	if gcPercent == gcPercentNotReady {
+		return
+	}
+	var err error
+	if n.IsReady() {
+		prev := debug.SetGCPercent(gcPercent)
+		if prev != gcPercent {
+			log.Infof("CLU: node is ready. changing GOGC from %d to %d", prev, gcPercent)
+			err = os.Setenv("GOGC", strconv.Itoa(gcPercent))
+		}
+	} else {
+		prev := debug.SetGCPercent(gcPercentNotReady)
+		if prev != gcPercentNotReady {
+			log.Infof("CLU: node is not ready. changing GOGC from %d to %d", prev, gcPercentNotReady)
+			err = os.Setenv("GOGC", strconv.Itoa(gcPercentNotReady))
+		}
+	}
+	if err != nil {
+		log.Warnf("CLU: could not set GOGC environment variable. gcPercent metric will be incorrect. %s", err.Error())
+	}
+}
+
+// SetState sets the state of the node and returns whether the state changed
+func (n *HTTPNode) SetState(state NodeState) bool {
+	if n.State == state {
+		return false
+	}
+	n.State = state
+	now := time.Now()
+	n.Updated = now
+	n.StateChange = now
+	n.readyStateGCHandler()
+	return true
+}
+
+// SetPriority sets the priority of the node and returns whether it changed
+func (n *HTTPNode) SetPriority(prio int) bool {
+	if n.Priority == prio {
+		return false
+	}
+	n.Priority = prio
+	n.Updated = time.Now()
+	n.readyStateGCHandler()
+	return true
+}
+
+// SetPrimary sets the primary state of the node and returns whether it changed
+func (n *HTTPNode) SetPrimary(primary bool) bool {
+	if n.Primary == primary {
+		return false
+	}
+	now := time.Now()
+	n.Primary = primary
+	n.Updated = now
+	n.PrimaryChange = now
+	return true
+}
+
+// SetPartitions sets the partitions that this node is handling
+func (n *HTTPNode) SetPartitions(part []int32) {
+	n.Partitions = part
+	n.Updated = time.Now()
+}
+
 func (n HTTPNode) Post(ctx context.Context, name, path string, body Traceable) (ret []byte, err error) {
 	ctx, span := tracing.NewSpan(ctx, Tracer, name)
 	tags.SpanKindRPCClient.Set(span)
@@ -202,7 +272,8 @@ func (n HTTPNode) GetName() string {
 func handleResp(rsp *http.Response) ([]byte, error) {
 	defer rsp.Body.Close()
 	if rsp.StatusCode != 200 {
-		ioutil.ReadAll(rsp.Body)
+		// Read in body so that the connection can be reused
+		io.Copy(ioutil.Discard, rsp.Body)
 		return nil, NewError(rsp.StatusCode, fmt.Errorf(rsp.Status))
 	}
 	return ioutil.ReadAll(rsp.Body)

@@ -52,6 +52,16 @@ how many metrics were hit fully (all needed chunks in cache)
 how many metrics were hit partially (some of the needed chunks in cache, but not all)
 * `cache.ops.metric.miss`:  
 how many metrics were missed fully (no needed chunks in cache)
+* `cache.overhead.chunk`:  
+an approximation of the overhead used to store chunks in the cache
+* `cache.overhead.flat`:  
+an approximation of the overhead used by flat accounting
+* `cache.overhead.lru`:  
+an approximation of the overhead used by the LRU
+* `cache.size.max`:  
+the maximum size of the cache (overhead does not count towards this limit)
+* `cache.size.used`:  
+how much of the cache is used (sum of the chunk data without overhead)
 * `cluster.decode_err.join`:  
 a counter of json unmarshal errors
 * `cluster.decode_err.update`:  
@@ -75,10 +85,6 @@ partition (%d) that we have not yet consumed.
 the size of the kafka partition (%d), aka the newest available offset.
 * `cluster.notifier.kafka.partition.%d.offset`:  
 the current offset for the partition (%d) that we have consumed
-* `cluster.notifier.nsq.message_size`:  
-the sizes seen of messages through the nsq cluster notifier
-* `cluster.notifier.nsq.messages-published`:  
-a counter of messages published to the nsq cluster notifier
 * `cluster.self.partitions`:  
 the number of partitions this instance consumes
 * `cluster.self.priority`:  
@@ -102,6 +108,32 @@ the number of nodes we know to be primary and ready
 the number of nodes we know to be secondary and not ready
 * `cluster.total.state.secondary-ready`:  
 the number of nodes we know to be secondary and ready
+* `idx.bigtable.add`:  
+the duration of an add of one metric to the bigtable idx, including the add to the in-memory index, excluding the insert query
+* `idx.bigtable.delete`:  
+the duration of a delete of one or more metrics from the bigtable idx, including the delete from the in-memory index and the delete query
+* `idx.bigtable.prune`:  
+the duration of a prune of the bigtable idx, including the prune of the in-memory index and all needed delete queries
+* `idx.bigtable.query-delete.exec`:  
+time spent executing deletes (possibly repeatedly until success)
+* `idx.bigtable.query-delete.fail`:  
+how many delete queries for a metric failed (triggered by an update or a delete)
+* `idx.bigtable.query-delete.ok`:  
+how many delete queries for a metric completed successfully (triggered by an update or a delete)
+* `idx.bigtable.query-insert.exec`:  
+time spent executing inserts (possibly repeatedly until success)
+* `idx.bigtable.query-insert.fail`:  
+how many insert queries for a metric failed (triggered by an add or an update)
+* `idx.bigtable.query-insert.ok`:  
+how many insert queries for a metric completed successfully (triggered by an add or an update)
+* `idx.bigtable.query-insert.wait`:  
+time inserts spent in queue before being executed
+* `idx.bigtable.save.bytes-per-request`:  
+the number of bytes written to bigtable in each request.
+* `idx.bigtable.save.skipped`:  
+how many saves have been skipped due to the writeQueue being full
+* `idx.bigtable.update`:  
+the duration of an update of one metric to the bigtable idx, including the update to the in-memory index, excluding any insert/delete queries
 * `idx.cassadra.query-delete.ok`:  
 how many delete queries for a metric completed successfully (triggered by an update or a delete)
 * `idx.cassadra.query-insert.ok`:  
@@ -196,6 +228,8 @@ the number of bytes currently obtained from the system by the process.  This is 
 a gauge of currently allocated (within the runtime) memory.
 * `memory.gc.cpu_fraction`:  
 how much cpu is consumed by the GC across process lifetime, in pro-mille
+* `memory.gc.gogc`:  
+the current GOGC value (derived from the GOGC environment variable)
 * `memory.gc.heap_objects`:  
 how many objects are allocated on the heap, it's a key indicator for GC workload
 * `memory.gc.last_duration`:  
@@ -230,6 +264,30 @@ an invalid tag for a metric is encountered.
 each time this happens, an error is logged with more details.
 * `stats.generate_message`:  
 how long it takes to generate the stats
+* `store.bigtable.chunk_operations.save_fail`:  
+counter of failed saves
+* `store.bigtable.chunk_operations.save_ok`:  
+counter of successful saves
+* `store.bigtable.chunk_size.at_load`:  
+the sizes of chunks seen when loading them
+* `store.bigtable.chunk_size.at_save`:  
+the sizes of chunks seen when saving them
+* `store.bigtable.chunks_per_row`:  
+how many chunks are retrieved per row in get queries
+* `store.bigtable.get.error`:  
+the count of reads that failed
+* `store.bigtable.get.exec`:  
+the duration of getting from bigtable store
+* `store.bigtable.get.wait`:  
+the duration of the get spent in the queue
+* `store.bigtable.put.bytes`:  
+the number of chunk bytes saved in each bulkApply
+* `store.bigtable.put.exec`:  
+the duration of putting in bigtable store
+* `store.bigtable.put.wait`:  
+the duration of a put in the wait queue
+* `store.bigtable.rows_per_response`:  
+how many rows come per get response
 * `store.cassandra.chunk_operations.save_fail`:  
 counter of failed saves
 * `store.cassandra.chunk_operations.save_ok`:  

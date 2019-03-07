@@ -10,8 +10,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/raintank/schema"
-
 	"github.com/gocql/gocql"
 	"github.com/grafana/metrictank/cluster"
 	"github.com/grafana/metrictank/cluster/partitioner"
@@ -22,6 +20,7 @@ import (
 	"github.com/grafana/metrictank/mdata/chunk/archive"
 	cassandraStore "github.com/grafana/metrictank/store/cassandra"
 	"github.com/raintank/dur"
+	"github.com/raintank/schema"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -69,7 +68,7 @@ var (
 		"If true existing chunks may be overwritten",
 	)
 
-	gitHash = "(none)"
+	version = "(none)"
 )
 
 type Server struct {
@@ -155,7 +154,8 @@ func main() {
 
 	globalFlags.Parse(os.Args[1:cassI])
 	cassFlags.Parse(os.Args[cassI+1 : len(os.Args)])
-	cassandra.Enabled = true
+	cassandra.CliConfig.Enabled = true
+	cassandra.ConfigProcess()
 
 	if *verbose {
 		log.SetLevel(log.DebugLevel)
@@ -180,13 +180,13 @@ func main() {
 		panic(fmt.Sprintf("Failed to instantiate partitioner: %q", err))
 	}
 
-	cluster.Init("mt-whisper-importer-writer", gitHash, time.Now(), "http", int(80))
+	cluster.Init("mt-whisper-importer-writer", version, time.Now(), "http", int(80))
 
 	server := &Server{
 		Session:     store.Session,
 		TTLTables:   ttlTables,
 		Partitioner: p,
-		Index:       cassandra.New(),
+		Index:       cassandra.New(cassandra.CliConfig),
 		HTTPServer: &http.Server{
 			Addr:        *httpEndpoint,
 			ReadTimeout: 10 * time.Minute,
@@ -274,11 +274,11 @@ func (s *Server) insertChunks(table, id string, ttl uint32, itergens []chunk.Ite
 	}
 	log.Debug(query)
 	for _, ig := range itergens {
-		rowKey := fmt.Sprintf("%s_%d", id, ig.Ts/cassandraStore.Month_sec)
+		rowKey := fmt.Sprintf("%s_%d", id, ig.T0/cassandraStore.Month_sec)
 		success := false
 		attempts := 0
 		for !success {
-			err := s.Session.Query(query, rowKey, ig.Ts, cassandraStore.PrepareChunkData(ig.Span, ig.Bytes())).Exec()
+			err := s.Session.Query(query, rowKey, ig.T0, ig.B).Exec()
 			if err != nil {
 				if (attempts % 20) == 0 {
 					log.Warnf("CS: failed to save chunk to cassandra after %d attempts. %s", attempts+1, err)

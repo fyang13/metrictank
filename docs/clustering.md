@@ -39,7 +39,7 @@ The primary sends out persistence messages when it saves chunks to Cassandra.  T
 If you want to be able to promote secondaries to primaries, it's important they have been ingesting and processing these messages, so that the moment they become primary,
 they don't start saving all the chunks it has in memory, which could be a significant sudden load on Cassandra.
 
-Metrictank supports 2 transports for clustering (kafka and NSQ), configured in the [clustering transports section in the config](https://github.com/grafana/metrictank/blob/master/docs/config.md#clustering-transports)
+Metrictank supports 1 transports for clustering: kafka, configured in the [clustering transports section in the config](https://github.com/grafana/metrictank/blob/master/docs/config.md#clustering-transports)
 
 Instances should not become primary when they have incomplete chunks (though in worst case scenario, you might
 have to do just that).  So they expose metrics that describe when they are ready to be upgraded.
@@ -83,6 +83,41 @@ partitions | 0,1 | 0,2 | 1,3 | 2,3 |
 This would offer better load balancing should node A fail (B and C will each take over a portion of the load), but will require making primary status a per-partition concept.
 Hence, this is currently **not supported**.
 
+## Priority and ready state
+
+Priority is a measure of how in-sync a metrictank process is, expressed in seconds.
+
+| input plugin  | priority                 |
+| ------------- | ------------------------ |
+| carbon-in     | 0                        |
+| prometheus-in | 0                        |
+| kafka-mdm-in  | estimate of consumer lag |
+
+When the input plugin is not sure, or not started yet priority is 10k (2.8 hours)
+
+* the priority value is gossiped to all peers in a sharding cluster
+* To satisfy queries from users, requests are fanned out across the cluster across all ready instances (see below), favoring lower priority instances.
+* The priority can be inspected via http endpoints like `/cluster`, `/priority`, `/node` or via the dashboard/metrics.
+
+Readyness or "ready state":
+
+(whenever we say "ready", "ready state" we mean the value taking into account priority, not the internal NodeState, as explained below)
+
+* indicates whether an instance is considered ready to satisfy data requests
+* refuses data or index requests when not ready
+* Can be checked via the `/` http endpoint. [more info](http-api.md#get-app-status)
+* Can control the GC setting via the `cluster.gc-percent-not-ready` setting.
+
+A node is ready when all of the following are true:
+* priority does not exceed the `cluster.max-priority` setting, which defaults to 10.
+* its internal NodeState is ready, which happens:
+  * for primary nodes, immediately after startup (loading index, starting input plugins, etc)
+  * for secondary nodes, "warm-up-period" after startup.
+
+Special cases:
+* the `/node` and `/cluster` endpoint shows the internal state of the node, including the internal NodeState.
+* what is gossiped across the cluster is also the full internal node state (including NodeState, priority, etc)
+* The `cluster.self.state.ready.gauge1` metric is also the internal NodeState, whereas the `cluster.total.state` metrics use the normal ready state.
 
 ## Caveats
 
@@ -96,5 +131,4 @@ Enable the `create-keyspace` on only one node, or leave it enabled for all, but 
 
 ## Other
 - use min-available-shards to control how many unavailable shards are tolerable
-- use max-priority to control how much priority / data log is tolerable (note: lowest lag shards are preferred)
 - note: currently if a shard fails, it doesn't retry other instance in the same request

@@ -1,6 +1,7 @@
 package kafkamdm
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"strconv"
@@ -8,17 +9,15 @@ import (
 	"sync"
 	"time"
 
-	"github.com/raintank/schema"
-	"github.com/raintank/schema/msg"
-
 	"github.com/Shopify/sarama"
-	"github.com/rakyll/globalconf"
-	log "github.com/sirupsen/logrus"
-
+	"github.com/grafana/globalconf"
 	"github.com/grafana/metrictank/cluster"
 	"github.com/grafana/metrictank/input"
 	"github.com/grafana/metrictank/kafka"
 	"github.com/grafana/metrictank/stats"
+	"github.com/raintank/schema"
+	"github.com/raintank/schema/msg"
+	log "github.com/sirupsen/logrus"
 )
 
 // metric input.kafka-mdm.metrics_per_message is how many metrics per message were seen.
@@ -34,10 +33,9 @@ type KafkaMdm struct {
 	lagMonitor *LagMonitor
 	wg         sync.WaitGroup
 
-	// signal to PartitionConsumers to shutdown
-	stopConsuming chan struct{}
+	shutdown chan struct{}
 	// signal to caller that it should shutdown
-	fatal chan struct{}
+	cancel context.CancelFunc
 }
 
 func (k *KafkaMdm) Name() string {
@@ -46,6 +44,7 @@ func (k *KafkaMdm) Name() string {
 
 var Enabled bool
 var orgId uint
+var kafkaVersionStr string
 var brokerStr string
 var brokers []string
 var topicStr string
@@ -53,7 +52,6 @@ var topics []string
 var partitionStr string
 var partitions []int32
 var offsetStr string
-var DataDir string
 var config *sarama.Config
 var channelBufferSize int
 var consumerFetchMin int
@@ -61,30 +59,25 @@ var consumerFetchDefault int
 var consumerMaxWaitTime time.Duration
 var consumerMaxProcessingTime time.Duration
 var netMaxOpenRequests int
-var offsetMgr *kafka.OffsetMgr
 var offsetDuration time.Duration
-var offsetCommitInterval time.Duration
-var partitionOffset map[int32]*stats.Gauge64
-var partitionLogSize map[int32]*stats.Gauge64
-var partitionLag map[int32]*stats.Gauge64
+var kafkaStats stats.Kafka
 
 func ConfigSetup() {
 	inKafkaMdm := flag.NewFlagSet("kafka-mdm-in", flag.ExitOnError)
 	inKafkaMdm.BoolVar(&Enabled, "enabled", false, "")
 	inKafkaMdm.UintVar(&orgId, "org-id", 0, "For incoming MetricPoint messages without org-id, assume this org id")
 	inKafkaMdm.StringVar(&brokerStr, "brokers", "kafka:9092", "tcp address for kafka (may be be given multiple times as a comma-separated list)")
+	inKafkaMdm.StringVar(&kafkaVersionStr, "kafka-version", "0.10.0.0", "Kafka version in semver format. All brokers must be this version or newer.")
 	inKafkaMdm.StringVar(&topicStr, "topics", "mdm", "kafka topic (may be given multiple times as a comma-separated list)")
-	inKafkaMdm.StringVar(&offsetStr, "offset", "last", "Set the offset to start consuming from. Can be one of newest, oldest,last or a time duration")
+	inKafkaMdm.StringVar(&offsetStr, "offset", "newest", "Set the offset to start consuming from. Can be oldest, newest or a time duration")
 	inKafkaMdm.StringVar(&partitionStr, "partitions", "*", "kafka partitions to consume. use '*' or a comma separated list of id's")
-	inKafkaMdm.DurationVar(&offsetCommitInterval, "offset-commit-interval", time.Second*5, "Interval at which offsets should be saved.")
-	inKafkaMdm.StringVar(&DataDir, "data-dir", "", "Directory to store partition offsets index")
 	inKafkaMdm.IntVar(&channelBufferSize, "channel-buffer-size", 1000, "The number of metrics to buffer in internal and external channels")
 	inKafkaMdm.IntVar(&consumerFetchMin, "consumer-fetch-min", 1, "The minimum number of message bytes to fetch in a request")
 	inKafkaMdm.IntVar(&consumerFetchDefault, "consumer-fetch-default", 32768, "The default number of message bytes to fetch in a request")
 	inKafkaMdm.DurationVar(&consumerMaxWaitTime, "consumer-max-wait-time", time.Second, "The maximum amount of time the broker will wait for Consumer.Fetch.Min bytes to become available before it returns fewer than that anyway")
 	inKafkaMdm.DurationVar(&consumerMaxProcessingTime, "consumer-max-processing-time", time.Second, "The maximum amount of time the consumer expects a message takes to process")
 	inKafkaMdm.IntVar(&netMaxOpenRequests, "net-max-open-requests", 100, "How many outstanding requests a connection is allowed to have before sending on it blocks")
-	globalconf.Register("kafka-mdm-in", inKafkaMdm)
+	globalconf.Register("kafka-mdm-in", inKafkaMdm, flag.ExitOnError)
 }
 
 func ConfigProcess(instance string) {
@@ -92,18 +85,19 @@ func ConfigProcess(instance string) {
 		return
 	}
 
-	if offsetCommitInterval == 0 {
-		log.Fatal("kafkamdm: offset-commit-interval must be greater then 0")
+	kafkaVersion, err := sarama.ParseKafkaVersion(kafkaVersionStr)
+	if err != nil {
+		log.Fatalf("kafkamdm: invalid kafka-version. %s", err)
 	}
+
 	if consumerMaxWaitTime == 0 {
 		log.Fatal("kafkamdm: consumer-max-wait-time must be greater then 0")
 	}
 	if consumerMaxProcessingTime == 0 {
 		log.Fatal("kafkamdm: consumer-max-processing-time must be greater then 0")
 	}
-	var err error
+
 	switch offsetStr {
-	case "last":
 	case "oldest":
 	case "newest":
 	default:
@@ -113,10 +107,6 @@ func ConfigProcess(instance string) {
 		}
 	}
 
-	offsetMgr, err = kafka.NewOffsetMgr(DataDir)
-	if err != nil {
-		log.Fatalf("kafkamdm: couldnt create offsetMgr. %s", err)
-	}
 	brokers = strings.Split(brokerStr, ",")
 	topics = strings.Split(topicStr, ",")
 
@@ -129,7 +119,7 @@ func ConfigProcess(instance string) {
 	config.Consumer.MaxWaitTime = consumerMaxWaitTime
 	config.Consumer.MaxProcessingTime = consumerMaxProcessingTime
 	config.Net.MaxOpenRequests = netMaxOpenRequests
-	config.Version = sarama.V0_10_0_0
+	config.Version = kafkaVersion
 	err = config.Validate()
 	if err != nil {
 		log.Fatalf("kafkamdm: invalid config: %s", err)
@@ -168,18 +158,13 @@ func ConfigProcess(instance string) {
 		cluster.Manager.SetPartitions(partitions)
 	}
 
-	// initialize our offset metrics
-	partitionOffset = make(map[int32]*stats.Gauge64)
-	partitionLogSize = make(map[int32]*stats.Gauge64)
-	partitionLag = make(map[int32]*stats.Gauge64)
-	for _, part := range partitions {
-		// metric input.kafka-mdm.partition.%d.offset is the current offset for the partition (%d) that we have consumed.
-		partitionOffset[part] = stats.NewGauge64(fmt.Sprintf("input.kafka-mdm.partition.%d.offset", part))
-		// metric input.kafka-mdm.partition.%d.log_size is the current size of the kafka partition (%d), aka the newest available offset.
-		partitionLogSize[part] = stats.NewGauge64(fmt.Sprintf("input.kafka-mdm.partition.%d.log_size", part))
-		// metric input.kafka-mdm.partition.%d.lag is how many messages (metrics) there are in the kafka partition (%d) that we have not yet consumed.
-		partitionLag[part] = stats.NewGauge64(fmt.Sprintf("input.kafka-mdm.partition.%d.lag", part))
-	}
+	// the extra empty newlines are because metrics2docs doesn't recognize the comments properly otherwise
+	// metric input.kafka-mdm.partition.%d.offset is the current offset for the partition (%d) that we have consumed.
+
+	// metric input.kafka-mdm.partition.%d.log_size is the current size of the kafka partition (%d), aka the newest available offset.
+
+	// metric input.kafka-mdm.partition.%d.lag is how many messages (metrics) there are in the kafka partition (%d) that we have not yet consumed.
+	kafkaStats = stats.NewKafka("input.kafka-mdm", partitions)
 }
 
 func New() *KafkaMdm {
@@ -193,18 +178,18 @@ func New() *KafkaMdm {
 	}
 	log.Info("kafkamdm: consumer created without error")
 	k := KafkaMdm{
-		consumer:      consumer,
-		client:        client,
-		lagMonitor:    NewLagMonitor(10, partitions),
-		stopConsuming: make(chan struct{}),
+		consumer:   consumer,
+		client:     client,
+		lagMonitor: NewLagMonitor(10, partitions),
+		shutdown:   make(chan struct{}),
 	}
 
 	return &k
 }
 
-func (k *KafkaMdm) Start(handler input.Handler, fatal chan struct{}) error {
+func (k *KafkaMdm) Start(handler input.Handler, cancel context.CancelFunc) error {
 	k.Handler = handler
-	k.fatal = fatal
+	k.cancel = cancel
 	var err error
 	for _, topic := range topics {
 		for _, partition := range partitions {
@@ -214,12 +199,6 @@ func (k *KafkaMdm) Start(handler input.Handler, fatal chan struct{}) error {
 				offset = sarama.OffsetOldest
 			case "newest":
 				offset = sarama.OffsetNewest
-			case "last":
-				offset, err = offsetMgr.Last(topic, partition)
-				if err != nil {
-					log.Errorf("kafkamdm: Failed to get %q duration offset for %s:%d. %q", offsetStr, topic, partition, err)
-					return err
-				}
 			default:
 				offset, err = k.client.GetOffset(topic, partition, time.Now().Add(-1*offsetDuration).UnixNano()/int64(time.Millisecond))
 				if err != nil {
@@ -269,19 +248,15 @@ func (k *KafkaMdm) tryGetOffset(topic string, partition int32, offset int64, att
 	return val, err
 }
 
-// this will continually consume from the topic until k.stopConsuming is triggered.
+// consumePartition consumes from the topic until k.shutdown is triggered.
 func (k *KafkaMdm) consumePartition(topic string, partition int32, currentOffset int64) {
 	defer k.wg.Done()
-
-	partitionOffsetMetric := partitionOffset[partition]
-	partitionLogSizeMetric := partitionLogSize[partition]
-	partitionLagMetric := partitionLag[partition]
 
 	// determine the pos of the topic and the initial offset of our consumer
 	newest, err := k.tryGetOffset(topic, partition, sarama.OffsetNewest, 7, time.Second*10)
 	if err != nil {
 		log.Errorf("kafkamdm: %s", err.Error())
-		close(k.fatal)
+		k.cancel()
 		return
 	}
 	if currentOffset == sarama.OffsetNewest {
@@ -290,62 +265,39 @@ func (k *KafkaMdm) consumePartition(topic string, partition int32, currentOffset
 		currentOffset, err = k.tryGetOffset(topic, partition, sarama.OffsetOldest, 7, time.Second*10)
 		if err != nil {
 			log.Errorf("kafkamdm: %s", err.Error())
-			close(k.fatal)
+			k.cancel()
 			return
 		}
 	}
 
-	partitionOffsetMetric.Set(int(currentOffset))
-	partitionLogSizeMetric.Set(int(newest))
-	partitionLagMetric.Set(int(newest - currentOffset))
+	kafkaStats := kafkaStats[partition]
+	kafkaStats.Offset.Set(int(currentOffset))
+	kafkaStats.LogSize.Set(int(newest))
+	kafkaStats.Lag.Set(int(newest - currentOffset))
+	go k.trackStats(topic, partition)
 
 	log.Infof("kafkamdm: consuming from %s:%d from offset %d", topic, partition, currentOffset)
 	pc, err := k.consumer.ConsumePartition(topic, partition, currentOffset)
 	if err != nil {
 		log.Errorf("kafkamdm: failed to start partitionConsumer for %s:%d. %s", topic, partition, err)
-		close(k.fatal)
+		k.cancel()
 		return
 	}
 	messages := pc.Messages()
-	ticker := time.NewTicker(offsetCommitInterval)
 	for {
 		select {
 		case msg, ok := <-messages:
 			// https://github.com/Shopify/sarama/wiki/Frequently-Asked-Questions#why-am-i-getting-a-nil-message-from-the-sarama-consumer
 			if !ok {
 				log.Errorf("kafkamdm: kafka consumer for %s:%d has shutdown. stop consuming", topic, partition)
-				if err := offsetMgr.Commit(topic, partition, currentOffset); err != nil {
-					log.Errorf("kafkamdm: failed to commit offset for %s:%d, %s", topic, partition, err)
-				}
-				close(k.fatal)
+				k.cancel()
 				return
 			}
 			log.Debugf("kafkamdm: received message: Topic %s, Partition: %d, Offset: %d, Key: %x", msg.Topic, msg.Partition, msg.Offset, msg.Key)
 			k.handleMsg(msg.Value, partition)
-			currentOffset = msg.Offset
-		case ts := <-ticker.C:
-			if err := offsetMgr.Commit(topic, partition, currentOffset); err != nil {
-				log.Errorf("kafkamdm: failed to commit offset for %s:%d, %s", topic, partition, err)
-			}
-			k.lagMonitor.StoreOffset(partition, currentOffset, ts)
-			newest, err := k.tryGetOffset(topic, partition, sarama.OffsetNewest, 1, 0)
-			if err != nil {
-				log.Errorf("kafkamdm: %s", err.Error())
-			} else {
-				partitionLogSizeMetric.Set(int(newest))
-			}
-
-			partitionOffsetMetric.Set(int(currentOffset))
-			if err == nil {
-				lag := int(newest - currentOffset)
-				partitionLagMetric.Set(lag)
-				k.lagMonitor.StoreLag(partition, lag)
-			}
-		case <-k.stopConsuming:
+			kafkaStats.Offset.Set(int(msg.Offset))
+		case <-k.shutdown:
 			pc.Close()
-			if err := offsetMgr.Commit(topic, partition, currentOffset); err != nil {
-				log.Errorf("kafkamdm: failed to commit offset for %s:%d, %s", topic, partition, err)
-			}
 			log.Infof("kafkamdm: consumer for %s:%d ended.", topic, partition)
 			return
 		}
@@ -380,18 +332,41 @@ func (k *KafkaMdm) handleMsg(data []byte, partition int32) {
 // and block until it stopped.
 func (k *KafkaMdm) Stop() {
 	// closes notifications and messages channels, amongst others
-	close(k.stopConsuming)
+	close(k.shutdown)
 	k.wg.Wait()
 	k.client.Close()
-	offsetMgr.Close()
+}
+
+func (k *KafkaMdm) trackStats(topic string, partition int32) {
+	ticker := time.NewTicker(time.Second)
+	kafkaStats := kafkaStats[partition]
+	for {
+		select {
+		case <-k.shutdown:
+			ticker.Stop()
+			return
+		case ts := <-ticker.C:
+			currentOffset := int64(kafkaStats.Offset.Peek())
+			newest, err := k.tryGetOffset(topic, partition, sarama.OffsetNewest, 1, 0)
+			if err != nil {
+				log.Errorf("kafkamdm: %s", err.Error())
+				continue
+			}
+			kafkaStats.LogSize.Set(int(newest))
+			lag := int(newest - currentOffset)
+			kafkaStats.Lag.Set(lag)
+			k.lagMonitor.StoreOffsets(partition, currentOffset, newest, ts)
+		}
+	}
 }
 
 func (k *KafkaMdm) MaintainPriority() {
 	go func() {
-		ticker := time.NewTicker(time.Second * 10)
+		ticker := time.NewTicker(time.Second)
 		for {
 			select {
-			case <-k.stopConsuming:
+			case <-k.shutdown:
+				ticker.Stop()
 				return
 			case <-ticker.C:
 				cluster.Manager.SetPriority(k.lagMonitor.Metric())

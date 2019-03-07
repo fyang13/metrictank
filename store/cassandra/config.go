@@ -3,10 +3,11 @@ package cassandra
 import (
 	"flag"
 
-	"github.com/rakyll/globalconf"
+	"github.com/grafana/globalconf"
 )
 
 type StoreConfig struct {
+	Enabled                  bool
 	Addrs                    string
 	Keyspace                 string
 	Consistency              string
@@ -34,6 +35,7 @@ type StoreConfig struct {
 // return StoreConfig with default values set.
 func NewStoreConfig() *StoreConfig {
 	return &StoreConfig{
+		Enabled:                  true,
 		Addrs:                    "localhost",
 		Keyspace:                 "metrictank",
 		Consistency:              "one",
@@ -63,6 +65,7 @@ var CliConfig = NewStoreConfig()
 
 func ConfigSetup() *flag.FlagSet {
 	cas := flag.NewFlagSet("cassandra", flag.ExitOnError)
+	cas.BoolVar(&CliConfig.Enabled, "enabled", CliConfig.Enabled, "enable the cassandra backend store plugin")
 	cas.StringVar(&CliConfig.Addrs, "addrs", CliConfig.Addrs, "cassandra host (may be given multiple times as comma-separated list)")
 	cas.StringVar(&CliConfig.Keyspace, "keyspace", CliConfig.Keyspace, "cassandra keyspace to use for storing the metric data table")
 	cas.StringVar(&CliConfig.Consistency, "consistency", CliConfig.Consistency, "write consistency (any|one|two|three|quorum|all|local_quorum|each_quorum|local_one")
@@ -85,6 +88,6 @@ func ConfigSetup() *flag.FlagSet {
 	cas.StringVar(&CliConfig.Username, "username", CliConfig.Username, "username for authentication")
 	cas.StringVar(&CliConfig.Password, "password", CliConfig.Password, "password for authentication")
 	cas.StringVar(&CliConfig.SchemaFile, "schema-file", CliConfig.SchemaFile, "File containing the needed schemas in case database needs initializing")
-	globalconf.Register("cassandra", cas)
+	globalconf.Register("cassandra", cas, flag.ExitOnError)
 	return cas
 }

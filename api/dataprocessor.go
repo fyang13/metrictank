@@ -12,7 +12,7 @@ import (
 	"github.com/grafana/metrictank/api/models"
 	"github.com/grafana/metrictank/consolidation"
 	"github.com/grafana/metrictank/mdata"
-	"github.com/grafana/metrictank/mdata/chunk"
+	"github.com/grafana/metrictank/mdata/chunk/tsz"
 	"github.com/grafana/metrictank/tracing"
 	"github.com/grafana/metrictank/util"
 	opentracing "github.com/opentracing/opentracing-go"
@@ -37,15 +37,6 @@ func doRecover(errp *error) {
 		}
 	}
 	return
-}
-
-type limiter chan struct{}
-
-func (l limiter) enter() { l <- struct{}{} }
-func (l limiter) leave() { <-l }
-
-func newLimiter(l int) limiter {
-	return make(chan struct{}, l)
 }
 
 type getTargetsResp struct {
@@ -253,22 +244,18 @@ func (s *Server) getTargetsLocal(ctx context.Context, reqs []models.Req) ([]mode
 	responses := make(chan getTargetsResp, len(reqs))
 
 	var wg sync.WaitGroup
-	reqLimiter := newLimiter(getTargetsConcurrency)
+	reqLimiter := util.NewLimiter(getTargetsConcurrency)
 
 	rCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 LOOP:
 	for _, req := range reqs {
-		// check to see if the request has been canceled, if so abort now.
-		select {
-		case <-rCtx.Done():
+		// if there are already getDataConcurrency goroutines running, then block
+		// until a slot becomes free or our context is canceled.
+		if !reqLimiter.Acquire(rCtx) {
 			//request canceled
 			break LOOP
-		default:
 		}
-		// if there are already getDataConcurrency goroutines running, then block
-		// until a slot becomes free.
-		reqLimiter.enter()
 		wg.Add(1)
 		go func(req models.Req) {
 			rCtx, span := tracing.NewSpan(rCtx, s.Tracer, "getTargetsLocal")
@@ -294,7 +281,7 @@ LOOP:
 			}
 			wg.Done()
 			// pop an item of our limiter so that other requests can be processed.
-			reqLimiter.leave()
+			reqLimiter.Release()
 			span.Finish()
 		}(req)
 	}
@@ -452,7 +439,7 @@ func (s *Server) getSeries(ctx *requestContext) (mdata.Result, error) {
 
 // itersToPoints converts the iters to points if they are within the from/to range
 // TODO: just work on the result directly
-func (s *Server) itersToPoints(ctx *requestContext, iters []chunk.Iter) []schema.Point {
+func (s *Server) itersToPoints(ctx *requestContext, iters []tsz.Iter) []schema.Point {
 	pre := time.Now()
 
 	points := pointSlicePool.Get().([]schema.Point)
@@ -467,7 +454,7 @@ func (s *Server) itersToPoints(ctx *requestContext, iters []chunk.Iter) []schema
 				points = append(points, schema.Point{Val: val, Ts: ts})
 			}
 		}
-		log.Debugf("DP getSeries: iter %d values good/total %d/%d", iter.T0, good, total)
+		log.Debugf("DP getSeries: iter values good/total %d/%d", good, total)
 	}
 	itersToPointsDuration.Value(time.Now().Sub(pre))
 	return points
@@ -492,8 +479,8 @@ func (s *Server) getSeriesAggMetrics(ctx *requestContext) (mdata.Result, error) 
 }
 
 // will only fetch until until, but uses ctx.To for debug logging
-func (s *Server) getSeriesCachedStore(ctx *requestContext, until uint32) ([]chunk.Iter, error) {
-	var iters []chunk.Iter
+func (s *Server) getSeriesCachedStore(ctx *requestContext, until uint32) ([]tsz.Iter, error) {
+	var iters []tsz.Iter
 	var prevts uint32
 
 	_, span := tracing.NewSpan(ctx.ctx, s.Tracer, "getSeriesCachedStore")
@@ -522,14 +509,14 @@ func (s *Server) getSeriesCachedStore(ctx *requestContext, until uint32) ([]chun
 
 	for _, itgen := range cacheRes.Start {
 		iter, err := itgen.Get()
-		prevts = itgen.Ts
+		prevts = itgen.T0
 		if err != nil {
 			// TODO(replay) figure out what to do if one piece is corrupt
 			tracing.Failure(span)
 			tracing.Errorf(span, "itergen: error getting iter from Start list %+v", err)
 			return iters, err
 		}
-		iters = append(iters, *iter)
+		iters = append(iters, iter)
 	}
 
 	// check to see if the request has been canceled, if so abort now.
@@ -556,7 +543,7 @@ func (s *Server) getSeriesCachedStore(ctx *requestContext, until uint32) ([]chun
 			}
 
 			for i, itgen := range storeIterGens {
-				it, err := itgen.Get()
+				iter, err := itgen.Get()
 				if err != nil {
 					// TODO(replay) figure out what to do if one piece is corrupt
 					tracing.Failure(span)
@@ -567,7 +554,7 @@ func (s *Server) getSeriesCachedStore(ctx *requestContext, until uint32) ([]chun
 					}
 					return iters, err
 				}
-				iters = append(iters, *it)
+				iters = append(iters, iter)
 			}
 			// it's important that the itgens get added in chronological order,
 			// currently we rely on store returning results in order
@@ -576,13 +563,13 @@ func (s *Server) getSeriesCachedStore(ctx *requestContext, until uint32) ([]chun
 
 		// the End slice is in reverse order
 		for i := len(cacheRes.End) - 1; i >= 0; i-- {
-			it, err := cacheRes.End[i].Get()
+			iter, err := cacheRes.End[i].Get()
 			if err != nil {
 				// TODO(replay) figure out what to do if one piece is corrupt
 				log.Errorf("itergen: error getting iter from cache result end slice %+v", err.Error())
 				return iters, err
 			}
-			iters = append(iters, *it)
+			iters = append(iters, iter)
 		}
 	}
 

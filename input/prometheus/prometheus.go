@@ -1,6 +1,7 @@
 package prometheus
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"io/ioutil"
@@ -8,12 +9,12 @@ import (
 
 	"github.com/gogo/protobuf/proto"
 	"github.com/golang/snappy"
+	"github.com/grafana/globalconf"
 	"github.com/grafana/metrictank/cluster"
 	"github.com/grafana/metrictank/input"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/prompb"
 	"github.com/raintank/schema"
-	"github.com/rakyll/globalconf"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -25,7 +26,6 @@ var (
 
 type prometheusWriteHandler struct {
 	input.Handler
-	quit chan struct{}
 }
 
 func New() *prometheusWriteHandler {
@@ -36,9 +36,8 @@ func (p *prometheusWriteHandler) Name() string {
 	return "prometheus"
 }
 
-func (p *prometheusWriteHandler) Start(handler input.Handler, fatal chan struct{}) error {
+func (p *prometheusWriteHandler) Start(handler input.Handler, cancel context.CancelFunc) error {
 	p.Handler = handler
-	p.quit = fatal
 	ConfigSetup()
 
 	mux := http.NewServeMux()
@@ -140,7 +139,7 @@ func ConfigSetup() {
 	inPrometheus.BoolVar(&Enabled, "enabled", false, "")
 	inPrometheus.StringVar(&addr, "addr", ":8000", "http listen address")
 	inPrometheus.IntVar(&partitionID, "partition", 0, "partition Id.")
-	globalconf.Register("prometheus-in", inPrometheus)
+	globalconf.Register("prometheus-in", inPrometheus, flag.ExitOnError)
 }
 
 func ConfigProcess() {

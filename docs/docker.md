@@ -1,4 +1,15 @@
-# docker stacks
+# docker
+
+## tags
+
+[metrictank on dockerhub](https://hub.docker.com/r/grafana/metrictank/)
+
+You can use these tags:
+
+* `latest`: the latest official stable release, corresponding to a git tag.
+* `master`: latest build from master. these versions typically bring improvements but possibly also new bugs
+
+## extra docker stacks
 
 You may have already followed [our docker quickstart guide](https://github.com/grafana/metrictank/blob/master/docs/quick-start-docker.md) but in fact,
 the metrictank repository contains a variety of docker stacks for different purposes.
@@ -24,6 +35,9 @@ Comes with 1 dashboard: the metrictank dashboard
 Similar to docker-standard, but custom metrictank build is loaded, custom configs from scripts/config
 also: tag support, main+extra dashboards
 
+### docker-dev-bigtable
+
+Same as docker-dev but instead of using cassandra as the backend store and index store it uses Bigtable via a bigtable emulator.
 
 ### docker-dev-scylla
 
