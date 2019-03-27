@@ -23,7 +23,6 @@ import (
 	inKafka "github.com/grafana/metrictank/input/kafkamdm"
 	"github.com/grafana/metrictank/logger"
 	"github.com/grafana/metrictank/mdata"
-	"github.com/grafana/metrictank/mdata/cache"
 	cassandraStore "github.com/grafana/metrictank/store/cassandra"
 	"github.com/raintank/dur"
 	"github.com/raintank/schema"
@@ -35,7 +34,6 @@ var (
 	// metrictank
 	aggMetrics  *mdata.AggMetrics
 	metricIndex idx.MetricIndex
-	apiServer   *api.Server
 	inputKafka  input.Plugin
 	store       mdata.Store
 
@@ -47,35 +45,31 @@ var (
 	metricMaxStaleStr = flag.String("metric-max-stale", "5m", "metric max stale age.")
 	gcIntervalStr     = flag.String("gc-interval", "2m", "gc interval.")
 	publicOrg         = flag.Int("public-org", 0, "org Id")
+    timeout           = flag.Int("timeout", 10, "the tool will exit if no kafka message is received during this interval ")
 
 	// backfilling
-	backfillEnd = "backfillEnd" // message used by input stream to indicate the end of backfilling
-	lastRcvTime int64           // epoch time when the previous kafka message was received
-	mux         sync.Mutex      // mutex to protect lastRcvTime
-	handler     inputHandler    // input message handler to track the last kafka receive event and handles kafka messages
+	lastRcvTime int64        // epoch time when the previous kafka message was received
+	mux         sync.Mutex   // mutex to protect lastRcvTime
+	handler     inputHandler // input message handler to track the last kafka receive event and handles kafka messages
 )
 
-// a kafka mesage handler that implements the input.Handler interface
+// a kafka message handler that implements the input.Handler interface
 type inputHandler struct {
-	dHandler input.DefaultHandler // default handler that processes metric metadata and points
-	finished chan bool            // this will be set if a message contains backfillEnd
+	handler  input.DefaultHandler // default handler that processes metric metadata and points
+	finished chan bool
 }
 
 func newInputHandler(metrics mdata.Metrics, metricIndex idx.MetricIndex, pluginName string) inputHandler {
 	dh := input.NewDefaultHandler(metrics, metricIndex, pluginName)
 	return inputHandler{
-		dHandler: dh,
+		handler:  dh,
 		finished: make(chan bool),
 	}
 }
 
 // input.Handler interface
 func (ih inputHandler) ProcessMetricData(metric *schema.MetricData, partition int32) {
-	if strings.Contains(metric.Name, backfillEnd) {
-		ih.finished <- true
-		return
-	}
-	ih.dHandler.ProcessMetricData(metric, partition)
+	ih.handler.ProcessMetricData(metric, partition)
 	mux.Lock()
 	defer mux.Unlock()
 	lastRcvTime = int64(time.Now().Unix())
@@ -83,7 +77,7 @@ func (ih inputHandler) ProcessMetricData(metric *schema.MetricData, partition in
 
 // input.Handler interface
 func (ih inputHandler) ProcessMetricPoint(point schema.MetricPoint, format msg.Format, partition int32) {
-	ih.dHandler.ProcessMetricPoint(point, format, partition)
+	ih.handler.ProcessMetricPoint(point, format, partition)
 	mux.Lock()
 	defer mux.Unlock()
 	lastRcvTime = int64(time.Now().Unix())
@@ -150,9 +144,6 @@ func main() {
 		log.Fatalf("failed to initialize cassandra store. %s", err)
 	}
 
-	// chunk cache
-	ccache := cache.NewCCache()
-
 	// memory store
 	chunkMaxStale := dur.MustParseNDuration("chunk-max-stale", *chunkMaxStaleStr)
 	metricMaxStale := dur.MustParseNDuration("metric-max-stale", *metricMaxStaleStr)
@@ -176,19 +167,6 @@ func main() {
 	memory.Enabled = true
 	metricIndex = memory.New()
 
-	// api server
-	apiServer, err = api.NewServer()
-	if err != nil {
-		log.Fatalf("Failed to start api server. %s", err.Error())
-	}
-	apiServer.BindMetricIndex(metricIndex)
-	apiServer.BindMemoryStore(aggMetrics)
-	apiServer.BindBackendStore(store)
-	apiServer.BindCache(ccache) // chunk cache should be disabled
-	apiServer.BindPromQueryEngine()
-
-	go apiServer.Run()
-
 	// load index entries
 	err = metricIndex.Init()
 	if err != nil {
@@ -205,7 +183,6 @@ func main() {
 		return
 	}
 	inputKafka.MaintainPriority()
-	apiServer.BindPrioritySetter(inputKafka)
 	lastRcvTime = int64(time.Now().Unix())
 	go handlerTimeout()
 
@@ -234,8 +211,8 @@ func handlerTimeout() {
 			mux.Lock()
 			prevRcv := lastRcvTime
 			mux.Unlock()
-			// wait for 3 minutes, if there is no more input, shut down
-			if now.Unix()-prevRcv > 180 {
+			// wait for timeout seconds, if there is no more input, shut down
+			if now.Unix()-prevRcv > int64(*timeout) {
 				log.Infof("Handler timeout, shutting down")
 				handler.finished <- true
 				ticker.Stop()
@@ -248,7 +225,6 @@ func handlerTimeout() {
 // normal shutdown
 func shutdown() {
 	cluster.Stop()
-	apiServer.Stop()
 	timer := time.NewTimer(time.Second * 20)
 	kafkaStopped := make(chan bool)
 	go func() {
@@ -267,3 +243,4 @@ func shutdown() {
 	store.Stop()
 	log.Info("shutting down.")
 }
+
