@@ -45,7 +45,7 @@ var (
 	metricMaxStaleStr = flag.String("metric-max-stale", "5m", "metric max stale age.")
 	gcIntervalStr     = flag.String("gc-interval", "2m", "gc interval.")
 	publicOrg         = flag.Int("public-org", 0, "org Id")
-    timeout           = flag.Int("timeout", 10, "the tool will exit if no kafka message is received during this interval ")
+	timeout           = flag.Int("timeout", 10, "the tool will exit if no kafka message is received during this interval ")
 
 	// backfilling
 	lastRcvTime int64        // epoch time when the previous kafka message was received
@@ -243,4 +243,3 @@ func shutdown() {
 	store.Stop()
 	log.Info("shutting down.")
 }
-
