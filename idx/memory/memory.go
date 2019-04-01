@@ -286,7 +286,7 @@ func (m *UnpartitionedMemoryIdx) Update(point schema.MetricPoint, partition int3
 
 	existing, ok := m.defById[point.MKey]
 	if ok {
-		log.Debugf("memory-idx: metricDef with id %v already in index", point.MKey)
+		//log.Debugf("memory-idx: metricDef with id %v already in index", point.MKey)
 
 		bumpLastUpdate(&existing.LastUpdate, int64(point.Time))
 

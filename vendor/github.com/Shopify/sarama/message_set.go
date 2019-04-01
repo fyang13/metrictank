@@ -1,8 +1,29 @@
 package sarama
 
+import "sync"
+
 type MessageBlock struct {
 	Offset int64
 	Msg    *Message
+}
+
+var messageBlockPool = sync.Pool{}
+
+func acquireMessageBlock() *MessageBlock {
+	val := messageBlockPool.Get()
+	if val != nil {
+		return val.(*MessageBlock)
+	}
+	return &MessageBlock{}
+}
+
+func releaseMessageBlock(m *MessageBlock) {
+	if m.Msg != nil {
+		releaseMessage(m.Msg)
+		m.Msg = nil
+	}
+
+	messageBlockPool.Put(m)
 }
 
 // Messages convenience helper which returns either all the
@@ -29,11 +50,12 @@ func (msb *MessageBlock) decode(pd packetDecoder) (err error) {
 		return err
 	}
 
-	if err = pd.push(&lengthField{}); err != nil {
+	lengthDecoder := acquireLengthField()
+	if err = pd.push(lengthDecoder); err != nil {
 		return err
 	}
 
-	msb.Msg = new(Message)
+	msb.Msg = acquireMessage()
 	if err = msb.Msg.decode(pd); err != nil {
 		return err
 	}
@@ -42,6 +64,8 @@ func (msb *MessageBlock) decode(pd packetDecoder) (err error) {
 		return err
 	}
 
+	releaseLengthField(lengthDecoder)
+
 	return nil
 }
 
@@ -49,6 +73,25 @@ type MessageSet struct {
 	PartialTrailingMessage bool // whether the set on the wire contained an incomplete trailing MessageBlock
 	OverflowMessage        bool // whether the set on the wire contained an overflow message
 	Messages               []*MessageBlock
+}
+
+var messageSetPool = sync.Pool{}
+
+func acquireMessageSet() *MessageSet {
+	val := messageSetPool.Get()
+	if val != nil {
+		return val.(*MessageSet)
+	}
+	return &MessageSet{}
+}
+
+func releaseMessageSet(m *MessageSet) {
+	for _, mb := range m.Messages {
+		releaseMessageBlock(mb)
+	}
+	m.Messages = m.Messages[:0]
+
+	messageSetPool.Put(m)
 }
 
 func (ms *MessageSet) encode(pe packetEncoder) error {
@@ -62,7 +105,9 @@ func (ms *MessageSet) encode(pe packetEncoder) error {
 }
 
 func (ms *MessageSet) decode(pd packetDecoder) (err error) {
-	ms.Messages = nil
+	if ms.Messages != nil {
+		ms.Messages = ms.Messages[:0]
+	}
 
 	for pd.remaining() > 0 {
 		magic, err := magicValue(pd)
@@ -78,7 +123,7 @@ func (ms *MessageSet) decode(pd packetDecoder) (err error) {
 			return nil
 		}
 
-		msb := new(MessageBlock)
+		msb := acquireMessageBlock()
 		err = msb.decode(pd)
 		switch err {
 		case nil:
@@ -102,7 +147,7 @@ func (ms *MessageSet) decode(pd packetDecoder) (err error) {
 }
 
 func (ms *MessageSet) addMessage(msg *Message) {
-	block := new(MessageBlock)
+	block := acquireMessageBlock()
 	block.Msg = msg
 	ms.Messages = append(ms.Messages, block)
 }
