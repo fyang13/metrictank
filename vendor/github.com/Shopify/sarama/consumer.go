@@ -19,18 +19,12 @@ type ConsumerMessage struct {
 	Headers        []*RecordHeader // only set if kafka is version 0.11+
 }
 
-var consumerMessagePool = make(chan *ConsumerMessage, 10000)
+var consumerMessagePool = sync.Pool{}
 
 func acquireConsumerMessage() *ConsumerMessage {
-	//val := consumerMessagePool.Get()
-	var val *ConsumerMessage
-	select {
-	case val = <-consumerMessagePool:
-	default:
-	}
-
+	val := consumerMessagePool.Get()
 	if val != nil {
-		return val
+		return val.(*ConsumerMessage)
 	}
 	return &ConsumerMessage{}
 }
@@ -49,13 +43,47 @@ func ReleaseConsumerMessage(m *ConsumerMessage) {
 	m.Timestamp = time.Time{}
 	m.BlockTimestamp = time.Time{}
 
+	consumerMessagePool.Put(m)
+}
+
+/*
+var consumerMessagePool = make(chan *ConsumerMessage, 10000)
+
+func acquireConsumerMessage() *ConsumerMessage {
+	//val := consumerMessagePool.Get()
+	var val *ConsumerMessage
+	select {
+	case val = <-consumerMessagePool:
+	default:
+	}
+
+	if val != nil {
+		return val
+	}
+	return &ConsumerMessage{}
+}
+
+func ReleaseConsumerMessage(m *ConsumerMessage) {
+	if m.Headers != nil {
+		m.Headers = m.Headers[:0]
+	}
+
+	m.Key = nil
+	m.Value = nil
+	m.Topic = ""
+	m.Partition = 0
+	m.Offset = 0
+	m.Timestamp = time.Time{}
+	m.BlockTimestamp = time.Time{}
+
 	select {
 	case consumerMessagePool <- m:
 	default:
 	}
 
-	//consumerMessagePool.Put(m)
+	consumerMessagePool.Put(m)
 }
+*/
 
 // ConsumerError is what is provided to the user when an error occurs.
 // It wraps an error and includes the topic and partition.
@@ -741,6 +769,7 @@ func (bc *brokerConsumer) subscriptionConsumer() {
 		}
 		bc.acks.Wait()
 		bc.handleResponses()
+		releaseFetchResponse(response)
 	}
 }
 
