@@ -50,7 +50,8 @@ func (msb *MessageBlock) decode(pd packetDecoder) (err error) {
 		return err
 	}
 
-	if err = pd.push(&lengthField{}); err != nil {
+	lengthDecoder := acquireLengthField()
+	if err = pd.push(lengthDecoder); err != nil {
 		return err
 	}
 
@@ -62,6 +63,8 @@ func (msb *MessageBlock) decode(pd packetDecoder) (err error) {
 	if err = pd.pop(); err != nil {
 		return err
 	}
+
+	releaseLengthField(lengthDecoder)
 
 	return nil
 }
@@ -86,6 +89,7 @@ func releaseMessageSet(m *MessageSet) {
 	for _, mb := range m.Messages {
 		releaseMessageBlock(mb)
 	}
+	m.Messages = m.Messages[:0]
 
 	messageSetPool.Put(m)
 }
@@ -101,7 +105,9 @@ func (ms *MessageSet) encode(pe packetEncoder) error {
 }
 
 func (ms *MessageSet) decode(pd packetDecoder) (err error) {
-	ms.Messages = nil
+	if ms.Messages != nil {
+		ms.Messages = ms.Messages[:0]
+	}
 
 	for pd.remaining() > 0 {
 		magic, err := magicValue(pd)
