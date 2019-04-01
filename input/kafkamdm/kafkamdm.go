@@ -293,7 +293,7 @@ func (k *KafkaMdm) consumePartition(topic string, partition int32, currentOffset
 				k.cancel()
 				return
 			}
-			log.Debugf("kafkamdm: received message: Topic %s, Partition: %d, Offset: %d, Key: %x", msg.Topic, msg.Partition, msg.Offset, msg.Key)
+			// log.Debugf("kafkamdm: received message: Topic %s, Partition: %d, Offset: %d, Key: %x", msg.Topic, msg.Partition, msg.Offset, msg.Key)
 			k.handleMsg(msg.Value, partition)
 			kafkaStats.Offset.Set(int(msg.Offset))
 			sarama.ReleaseConsumerMessage(msg)
