@@ -72,6 +72,15 @@ var (
 	errmetrics = cassandra.NewErrMetrics("store.cassandra")
 )
 
+type TraceWriter struct {
+	session *gocql.Session
+}
+
+func (t *TraceWriter) Write(p []byte) (n int, err error) {
+	log.Info(string(p[:len(p)-1]))
+	return len(p), nil
+}
+
 type ChunkReadRequest struct {
 	q         string
 	p         []interface{}
@@ -130,6 +139,7 @@ func NewCassandraStore(config *StoreConfig, ttls []uint32) (*CassandraStore, err
 	cluster.NumConns = config.WriteConcurrency
 	cluster.ProtoVersion = config.CqlProtocolVersion
 	cluster.DisableInitialHostLookup = config.DisableInitialHostLookup
+
 	var err error
 	tmpSession, err := cluster.CreateSession()
 	if err != nil {
@@ -224,6 +234,11 @@ func NewCassandraStore(config *StoreConfig, ttls []uint32) (*CassandraStore, err
 		return nil, err
 	}
 	log.Debugf("CS: created session with config %+v", config)
+
+	writer := &TraceWriter{session}
+	tracer := gocql.NewTraceWriter(session, writer)
+	session.SetTrace(tracer)
+
 	c := &CassandraStore{
 		Session:          session,
 		writeQueues:      make([]chan *mdata.ChunkWriteRequest, config.WriteConcurrency),
