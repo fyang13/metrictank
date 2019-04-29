@@ -1,6 +1,9 @@
 package sarama
 
-import "fmt"
+import (
+	"fmt"
+	"sync"
+)
 
 const (
 	unknownRecords = iota
@@ -16,6 +19,26 @@ type Records struct {
 	recordsType int
 	MsgSet      *MessageSet
 	RecordBatch *RecordBatch
+}
+
+var recordsPool = sync.Pool{}
+
+func acquireRecords() *Records {
+	val := recordsPool.Get()
+	if val != nil {
+		return val.(*Records)
+	}
+	return &Records{}
+}
+
+func releaseRecords(r *Records) {
+	r.recordsType = 0
+	if r.MsgSet != nil {
+		releaseMessageSet(r.MsgSet)
+		r.MsgSet = nil
+	}
+	r.RecordBatch = nil
+	recordsPool.Put(r)
 }
 
 func newLegacyRecords(msgSet *MessageSet) Records {
@@ -185,10 +208,5 @@ func (r *Records) isOverflow() (bool, error) {
 }
 
 func magicValue(pd packetDecoder) (int8, error) {
-	dec, err := pd.peek(magicOffset, magicLength)
-	if err != nil {
-		return 0, err
-	}
-
-	return dec.getInt8()
+	return pd.peekInt8(magicOffset)
 }

@@ -5,9 +5,10 @@ import (
 	"compress/gzip"
 	"fmt"
 	"io/ioutil"
+	"sync"
 	"time"
 
-	"github.com/eapache/go-xerial-snappy"
+	snappy "github.com/eapache/go-xerial-snappy"
 	"github.com/pierrec/lz4"
 )
 
@@ -49,6 +50,27 @@ type Message struct {
 
 	compressedCache []byte
 	compressedSize  int // used for computing the compression ratio metrics
+}
+
+var messagePool = sync.Pool{}
+
+func acquireMessage() *Message {
+	val := messagePool.Get()
+	if val != nil {
+		return val.(*Message)
+	}
+	return &Message{}
+}
+
+func releaseMessage(m *Message) {
+	m.Key = nil
+	m.Value = nil
+
+	if m.Set != nil {
+		releaseMessageSet(m.Set)
+		m.Set = nil
+	}
+	messagePool.Put(m)
 }
 
 func (m *Message) encode(pe packetEncoder) error {
@@ -129,7 +151,8 @@ func (m *Message) encode(pe packetEncoder) error {
 }
 
 func (m *Message) decode(pd packetDecoder) (err error) {
-	err = pd.push(newCRC32Field(crcIEEE))
+	crc32Decoder := acquireCrc32Field(crcIEEE)
+	err = pd.push(crc32Decoder)
 	if err != nil {
 		return err
 	}
@@ -212,12 +235,16 @@ func (m *Message) decode(pd packetDecoder) (err error) {
 		return PacketDecodingError{fmt.Sprintf("invalid compression specified (%d)", m.Codec)}
 	}
 
-	return pd.pop()
+	err = pd.pop()
+
+	releaseCrc32Field(crc32Decoder)
+
+	return err
 }
 
 // decodes a message set from a previousy encoded bulk-message
 func (m *Message) decodeSet() (err error) {
 	pd := realDecoder{raw: m.Value}
-	m.Set = &MessageSet{}
+	m.Set = acquireMessageSet()
 	return m.Set.decode(&pd)
 }

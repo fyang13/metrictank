@@ -298,6 +298,7 @@ func (k *KafkaMdm) consumePartition(topic string, partition int32, currentOffset
 			}
 			k.handleMsg(msg.Value, partition)
 			kafkaStats.Offset.Set(int(msg.Offset))
+			sarama.ReleaseConsumerMessage(msg)
 		case <-k.shutdown:
 			pc.Close()
 			log.Infof("kafkamdm: consumer for %s:%d ended.", topic, partition)

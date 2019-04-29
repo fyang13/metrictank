@@ -19,6 +19,72 @@ type ConsumerMessage struct {
 	Headers        []*RecordHeader // only set if kafka is version 0.11+
 }
 
+var consumerMessagePool = sync.Pool{}
+
+func acquireConsumerMessage() *ConsumerMessage {
+	val := consumerMessagePool.Get()
+	if val != nil {
+		return val.(*ConsumerMessage)
+	}
+	return &ConsumerMessage{}
+}
+
+// ReleaseConsumerMessage returns a ConsumerMessage instance to sync.Pool.
+func ReleaseConsumerMessage(m *ConsumerMessage) {
+	if m.Headers != nil {
+		m.Headers = m.Headers[:0]
+	}
+
+	m.Key = nil
+	m.Value = nil
+	m.Topic = ""
+	m.Partition = 0
+	m.Offset = 0
+	m.Timestamp = time.Time{}
+	m.BlockTimestamp = time.Time{}
+
+	consumerMessagePool.Put(m)
+}
+
+/*
+var consumerMessagePool = make(chan *ConsumerMessage, 10000)
+
+func acquireConsumerMessage() *ConsumerMessage {
+	//val := consumerMessagePool.Get()
+	var val *ConsumerMessage
+	select {
+	case val = <-consumerMessagePool:
+	default:
+	}
+
+	if val != nil {
+		return val
+	}
+	return &ConsumerMessage{}
+}
+
+func ReleaseConsumerMessage(m *ConsumerMessage) {
+	if m.Headers != nil {
+		m.Headers = m.Headers[:0]
+	}
+
+	m.Key = nil
+	m.Value = nil
+	m.Topic = ""
+	m.Partition = 0
+	m.Offset = 0
+	m.Timestamp = time.Time{}
+	m.BlockTimestamp = time.Time{}
+
+	select {
+	case consumerMessagePool <- m:
+	default:
+	}
+
+	consumerMessagePool.Put(m)
+}
+*/
+
 // ConsumerError is what is provided to the user when an error occurs.
 // It wraps an error and includes the topic and partition.
 type ConsumerError struct {
@@ -494,15 +560,15 @@ func (child *partitionConsumer) parseMessages(msgSet *MessageSet) ([]*ConsumerMe
 			if offset < child.offset {
 				continue
 			}
-			messages = append(messages, &ConsumerMessage{
-				Topic:          child.topic,
-				Partition:      child.partition,
-				Key:            msg.Msg.Key,
-				Value:          msg.Msg.Value,
-				Offset:         offset,
-				Timestamp:      msg.Msg.Timestamp,
-				BlockTimestamp: msgBlock.Msg.Timestamp,
-			})
+			m := acquireConsumerMessage()
+			m.Topic = child.topic
+			m.Partition = child.partition
+			m.Key = msg.Msg.Key
+			m.Value = msg.Msg.Value
+			m.Offset = offset
+			m.Timestamp = msg.Msg.Timestamp
+			m.BlockTimestamp = msgBlock.Msg.Timestamp
+			messages = append(messages, m)
 			child.offset = offset + 1
 		}
 	}
@@ -519,15 +585,15 @@ func (child *partitionConsumer) parseRecords(batch *RecordBatch) ([]*ConsumerMes
 		if offset < child.offset {
 			continue
 		}
-		messages = append(messages, &ConsumerMessage{
-			Topic:     child.topic,
-			Partition: child.partition,
-			Key:       rec.Key,
-			Value:     rec.Value,
-			Offset:    offset,
-			Timestamp: batch.FirstTimestamp.Add(rec.TimestampDelta),
-			Headers:   rec.Headers,
-		})
+		m := acquireConsumerMessage()
+		m.Topic = child.topic
+		m.Partition = child.partition
+		m.Key = rec.Key
+		m.Value = rec.Value
+		m.Offset = offset
+		m.Timestamp = batch.FirstTimestamp.Add(rec.TimestampDelta)
+		m.Headers = rec.Headers
+		messages = append(messages, m)
 		child.offset = offset + 1
 	}
 	if len(messages) == 0 {
@@ -703,6 +769,7 @@ func (bc *brokerConsumer) subscriptionConsumer() {
 		}
 		bc.acks.Wait()
 		bc.handleResponses()
+		releaseFetchResponse(response)
 	}
 }
 

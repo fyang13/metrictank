@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"hash/crc32"
+	"sync"
 )
 
 type crcPolynomial int8
@@ -19,6 +20,22 @@ var castagnoliTable = crc32.MakeTable(crc32.Castagnoli)
 type crc32Field struct {
 	startOffset int
 	polynomial  crcPolynomial
+}
+
+var crc32FieldPool = sync.Pool{}
+
+func acquireCrc32Field(polynomial crcPolynomial) *crc32Field {
+	val := crc32FieldPool.Get()
+	if val != nil {
+		c := val.(*crc32Field)
+		c.polynomial = polynomial
+		return c
+	}
+	return newCRC32Field(polynomial)
+}
+
+func releaseCrc32Field(c *crc32Field) {
+	crc32FieldPool.Put(c)
 }
 
 func (c *crc32Field) saveOffset(in int) {
