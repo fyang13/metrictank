@@ -9,9 +9,8 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/raintank/schema"
-
 	"github.com/grafana/metrictank/idx"
+	"github.com/raintank/schema"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -337,9 +336,19 @@ func NewTagQuery(expressions []string, from int64) (TagQuery, error) {
 // getInitialByEqual generates the initial resultset by executing the given equal expression
 func (q *TagQuery) getInitialByEqual(expr kv, idCh chan schema.MKey, stopCh chan struct{}) {
 	defer q.wg.Done()
+	key, err := idx.IdxIntern.GetPtrFromByte([]byte(expr.key))
+	if err != nil {
+		log.Error("memory-idx: Failed to retrieve uintptr for interned tag key: ", err)
+		internError.Inc()
+	}
+	value, err := idx.IdxIntern.GetPtrFromByte([]byte(expr.value))
+	if err != nil {
+		log.Error("memory-idx: Failed to retrieve uintptr for interned tag value: ", err)
+		internError.Inc()
+	}
 
 KEYS:
-	for k := range q.index[expr.key][expr.value] {
+	for k := range q.index[key][value] {
 		select {
 		case <-stopCh:
 			break KEYS
@@ -353,10 +362,20 @@ KEYS:
 // getInitialByPrefix generates the initial resultset by executing the given prefix match expression
 func (q *TagQuery) getInitialByPrefix(expr kv, idCh chan schema.MKey, stopCh chan struct{}) {
 	defer q.wg.Done()
+	key, err := idx.IdxIntern.GetPtrFromByte([]byte(expr.key))
+	if err != nil {
+		log.Error("memory-idx: Failed to retrieve uintptr for interned tag key: ", err)
+		internError.Inc()
+	}
 
 VALUES:
-	for v, ids := range q.index[expr.key] {
-		if !strings.HasPrefix(v, expr.value) {
+	for v, ids := range q.index[key] {
+		value, err := idx.IdxIntern.GetStringFromPtr(v)
+		if err != nil {
+			log.Error("memory-idx: Failed to retrieve uintptr for interned tag value: ", err)
+			internError.Inc()
+		}
+		if !strings.HasPrefix(value, expr.value) {
 			continue
 		}
 
@@ -375,13 +394,18 @@ VALUES:
 // getInitialByMatch generates the initial resultset by executing the given match expression
 func (q *TagQuery) getInitialByMatch(expr kvRe, idCh chan schema.MKey, stopCh chan struct{}) {
 	defer q.wg.Done()
+	key, err := idx.IdxIntern.GetPtrFromByte([]byte(expr.key))
+	if err != nil {
+		log.Error("memory-idx: Failed to retrieve uintptr for interned tag key: ", err)
+		internError.Inc()
+	}
 
 	// shortcut if value == nil.
 	// this will simply match any value, like ^.+. since we know that every value
 	// in the index must not be empty, we can skip the matching.
 	if expr.value == nil {
 	VALUES1:
-		for _, ids := range q.index[expr.key] {
+		for _, ids := range q.index[key] {
 			for id := range ids {
 				select {
 				case <-stopCh:
@@ -395,8 +419,13 @@ func (q *TagQuery) getInitialByMatch(expr kvRe, idCh chan schema.MKey, stopCh ch
 	}
 
 VALUES2:
-	for v, ids := range q.index[expr.key] {
-		if !expr.value.MatchString(v) {
+	for v, ids := range q.index[key] {
+		value, err := idx.IdxIntern.GetStringFromPtr(v)
+		if err != nil {
+			log.Error("memory-idx: Failed to retrieve uintptr for interned tag value: ", err)
+			internError.Inc()
+		}
+		if !expr.value.MatchString(value) {
 			continue
 		}
 
@@ -419,7 +448,12 @@ func (q *TagQuery) getInitialByTagPrefix(idCh chan schema.MKey, stopCh chan stru
 
 TAGS:
 	for tag, values := range q.index {
-		if !strings.HasPrefix(tag, q.tagPrefix) {
+		key, err := idx.IdxIntern.GetStringFromPtr(tag)
+		if err != nil {
+			log.Error("memory-idx: Failed to retrieve uintptr for interned tag key: ", err)
+			internError.Inc()
+		}
+		if !strings.HasPrefix(key, q.tagPrefix) {
 			continue
 		}
 
@@ -444,7 +478,12 @@ func (q *TagQuery) getInitialByTagMatch(idCh chan schema.MKey, stopCh chan struc
 
 TAGS:
 	for tag, values := range q.index {
-		if q.tagMatch.value.MatchString(tag) {
+		key, err := idx.IdxIntern.GetStringFromPtr(tag)
+		if err != nil {
+			log.Error("memory-idx: Failed to retrieve uintptr for interned tag key: ", err)
+			internError.Inc()
+		}
+		if q.tagMatch.value.MatchString(key) {
 			for _, ids := range values {
 				for id := range ids {
 					select {
@@ -540,7 +579,7 @@ func (q *TagQuery) testByMatch(def *idx.Archive, exprs []kvRe, not bool) bool {
 EXPRS:
 	for _, e := range exprs {
 		if e.key == "name" {
-			if e.value == nil || e.value.MatchString(def.Name) {
+			if e.value == nil || e.value.MatchString(def.Name.String()) {
 				if not {
 					return false
 				} else {
@@ -555,21 +594,23 @@ EXPRS:
 			}
 		}
 
-		prefix := e.key + "="
-		for _, tag := range def.Tags {
-			if !strings.HasPrefix(tag, prefix) {
+		for _, tag := range def.Tags.KeyValues {
+			key, err := idx.IdxIntern.GetStringFromPtr(tag.Key)
+			if err != nil {
+				log.Error("memory-idx: Failed to retrieve uintptr for interned tag key: ", err)
+				internError.Inc()
+			}
+			if key != e.key {
 				continue
 			}
 
-			value := tag[len(e.key)+1:]
-
 			// reduce regex matching by looking up cached non-matches
-			if _, ok := e.missCache.Load(value); ok {
+			if _, ok := e.missCache.Load(tag.Value); ok {
 				continue
 			}
 
 			// reduce regex matching by looking up cached matches
-			if _, ok := e.matchCache.Load(value); ok {
+			if _, ok := e.matchCache.Load(tag.Value); ok {
 				if not {
 					return false
 				}
@@ -578,9 +619,14 @@ EXPRS:
 
 			// value == nil means that this expression can be short cut
 			// by not evaluating it
+			value, err := idx.IdxIntern.GetStringFromPtr(tag.Value)
+			if err != nil {
+				log.Error("memory-idx: Failed to retrieve uintptr for interned tag value: ", err)
+				internError.Inc()
+			}
 			if e.value == nil || e.value.MatchString(value) {
 				if atomic.LoadInt32(&e.matchCacheSize) < int32(matchCacheSize) {
-					e.matchCache.Store(value, struct{}{})
+					e.matchCache.Store(tag.Value, struct{}{})
 					atomic.AddInt32(&e.matchCacheSize, 1)
 				}
 				if not {
@@ -589,7 +635,7 @@ EXPRS:
 				continue EXPRS
 			} else {
 				if atomic.LoadInt32(&e.missCacheSize) < int32(matchCacheSize) {
-					e.missCache.Store(value, struct{}{})
+					e.missCache.Store(tag.Value, struct{}{})
 					atomic.AddInt32(&e.missCacheSize, 1)
 				}
 			}
@@ -622,30 +668,27 @@ func (q *TagQuery) testByTagMatch(def *idx.Archive) bool {
 		}
 	}
 
-	for _, tag := range def.Tags {
-		equal := strings.Index(tag, "=")
-		if equal < 0 {
-			corruptIndex.Inc()
-			log.Errorf("memory-idx: ID %q has tag %q in index without '=' sign", def.Id, tag)
-			continue
-		}
-		key := tag[:equal]
-
-		if _, ok := q.tagMatch.missCache.Load(key); ok {
+	for _, tag := range def.Tags.KeyValues {
+		if _, ok := q.tagMatch.missCache.Load(tag.Key); ok {
 			continue
 		}
 
-		if _, ok := q.tagMatch.matchCache.Load(key); ok || q.tagMatch.value.MatchString(key) {
+		key, err := idx.IdxIntern.GetStringFromPtr(tag.Key)
+		if err != nil {
+			log.Error("memory-idx: Failed to retrieve uintptr for interned tag key: ", err)
+			internError.Inc()
+		}
+		if _, ok := q.tagMatch.matchCache.Load(tag.Key); ok || q.tagMatch.value.MatchString(key) {
 			if !ok {
 				if atomic.LoadInt32(&q.tagMatch.matchCacheSize) < int32(matchCacheSize) {
-					q.tagMatch.matchCache.Store(key, struct{}{})
+					q.tagMatch.matchCache.Store(tag.Key, struct{}{})
 					atomic.AddInt32(&q.tagMatch.matchCacheSize, 1)
 				}
 			}
 			return true
 		} else {
 			if atomic.LoadInt32(&q.tagMatch.missCacheSize) < int32(matchCacheSize) {
-				q.tagMatch.missCache.Store(key, struct{}{})
+				q.tagMatch.missCache.Store(tag.Key, struct{}{})
 				atomic.AddInt32(&q.tagMatch.missCacheSize, 1)
 			}
 			continue
@@ -665,13 +708,25 @@ func (q *TagQuery) testByFrom(def *idx.Archive) bool {
 func (q *TagQuery) testByPrefix(def *idx.Archive, exprs []kv) bool {
 EXPRS:
 	for _, e := range exprs {
-		if e.key == "name" && strings.HasPrefix(def.Name, e.value) {
+		if e.key == "name" && strings.HasPrefix(def.Name.String(), e.value) {
 			continue EXPRS
 		}
 
-		prefix := e.key + "=" + e.value
-		for _, tag := range def.Tags {
-			if !strings.HasPrefix(tag, prefix) {
+		for _, tag := range def.Tags.KeyValues {
+			key, err := idx.IdxIntern.GetStringFromPtr(tag.Key)
+			if err != nil {
+				log.Error("memory-idx: Failed to retrieve uintptr for interned tag key: ", err)
+				internError.Inc()
+			}
+			if e.key != key {
+				continue
+			}
+			value, err := idx.IdxIntern.GetStringFromPtr(tag.Value)
+			if err != nil {
+				log.Error("memory-idx: Failed to retrieve uintptr for interned tag value: ", err)
+				internError.Inc()
+			}
+			if !strings.HasPrefix(value, e.value) {
 				continue
 			}
 			continue EXPRS
@@ -687,8 +742,8 @@ func (q *TagQuery) testByTagPrefix(def *idx.Archive) bool {
 		return true
 	}
 
-	for _, tag := range def.Tags {
-		if strings.HasPrefix(tag, q.tagPrefix) {
+	for _, tag := range def.Tags.KeyValues {
+		if strings.HasPrefix(tag.String(), q.tagPrefix) {
 			return true
 		}
 	}
@@ -699,7 +754,17 @@ func (q *TagQuery) testByTagPrefix(def *idx.Archive) bool {
 // testByEqual filters a given metric by the defined "=" expressions
 func (q *TagQuery) testByEqual(id schema.MKey, exprs []kv, not bool) bool {
 	for _, e := range exprs {
-		indexIds := q.index[e.key][e.value]
+		key, err := idx.IdxIntern.GetPtrFromByte([]byte(e.key))
+		if err != nil {
+			log.Error("memory-idx: Failed to retrieve uintptr for interned tag key: ", err)
+			internError.Inc()
+		}
+		value, err := idx.IdxIntern.GetPtrFromByte([]byte(e.value))
+		if err != nil {
+			log.Error("memory-idx: Failed to retrieve uintptr for interned tag value: ", err)
+			internError.Inc()
+		}
+		indexIds := q.index[key][value]
 
 		// shortcut if key=value combo does not exist at all
 		if len(indexIds) == 0 {
@@ -752,18 +817,38 @@ func (q *TagQuery) filterIdsFromChan(idCh, resCh chan schema.MKey) {
 // already reduced set of results
 func (q *TagQuery) sortByCost() {
 	for i, kv := range q.equal {
-		q.equal[i].cost = uint(len(q.index[kv.key][kv.value]))
+		key, err := idx.IdxIntern.GetPtrFromByte([]byte(kv.key))
+		if err != nil {
+			log.Error("memory-idx: Failed to retrieve uintptr for interned tag key: ", err)
+			internError.Inc()
+		}
+		value, err := idx.IdxIntern.GetPtrFromByte([]byte(kv.value))
+		if err != nil {
+			log.Error("memory-idx: Failed to retrieve uintptr for interned tag value: ", err)
+			internError.Inc()
+		}
+		q.equal[i].cost = uint(len(q.index[key][value]))
 	}
 
 	// for prefix and match clauses we can't determine the actual cost
 	// without actually evaluating them, so we estimate based on
 	// cardinality of the key
 	for i, kv := range q.prefix {
-		q.prefix[i].cost = uint(len(q.index[kv.key]))
+		key, err := idx.IdxIntern.GetPtrFromByte([]byte(kv.key))
+		if err != nil {
+			log.Error("memory-idx: Failed to retrieve uintptr for interned tag key: ", err)
+			internError.Inc()
+		}
+		q.prefix[i].cost = uint(len(q.index[key]))
 	}
 
 	for i, kvRe := range q.match {
-		q.match[i].cost = uint(len(q.index[kvRe.key]))
+		key, err := idx.IdxIntern.GetPtrFromByte([]byte(kvRe.key))
+		if err != nil {
+			log.Error("memory-idx: Failed to retrieve uintptr for interned tag key: ", err)
+			internError.Inc()
+		}
+		q.match[i].cost = uint(len(q.index[key]))
 	}
 
 	sort.Sort(KvByCost(q.equal))
@@ -816,14 +901,24 @@ func (q *TagQuery) getMaxTagCount() int {
 
 	if q.tagClause == PREFIX_TAG && len(q.tagPrefix) > 0 {
 		for tag := range q.index {
-			if !strings.HasPrefix(tag, q.tagPrefix) {
+			key, err := idx.IdxIntern.GetStringFromPtr(tag)
+			if err != nil {
+				log.Error("memory-idx: Failed to retrieve uintptr for interned tag key: ", err)
+				internError.Inc()
+			}
+			if !strings.HasPrefix(key, q.tagPrefix) {
 				continue
 			}
 			maxTagCount++
 		}
 	} else if q.tagClause == MATCH_TAG {
 		for tag := range q.index {
-			if q.tagMatch.value.MatchString(tag) {
+			key, err := idx.IdxIntern.GetStringFromPtr(tag)
+			if err != nil {
+				log.Error("memory-idx: Failed to retrieve uintptr for interned tag key: ", err)
+				internError.Inc()
+			}
+			if q.tagMatch.value.MatchString(key) {
 				maxTagCount++
 			}
 		}
@@ -859,15 +954,12 @@ IDS:
 		// generate a set of all tags of the current metric that satisfy the
 		// tag filter condition
 		metricTags := make(map[string]struct{}, 0)
-		for _, tag := range def.Tags {
-			equal := strings.Index(tag, "=")
-			if equal < 0 {
-				corruptIndex.Inc()
-				log.Errorf("memory-idx: ID %q has tag %q in index without '=' sign", id, tag)
-				continue
+		for _, tag := range def.Tags.KeyValues {
+			key, err := idx.IdxIntern.GetStringFromPtr(tag.Key)
+			if err != nil {
+				log.Error("memory-idx: Failed to retrieve uintptr for interned tag key: ", err)
+				internError.Inc()
 			}
-
-			key := tag[:equal]
 			// this tag has already been pushed into tagCh, so we can stop evaluating
 			if _, ok := resultsCache[key]; ok {
 				continue
@@ -878,9 +970,9 @@ IDS:
 					continue
 				}
 			} else if q.tagClause == MATCH_TAG {
-				if _, ok := q.tagMatch.missCache.Load(key); ok || !q.tagMatch.value.MatchString(tag) {
+				if _, ok := q.tagMatch.missCache.Load(tag.Key); ok || !q.tagMatch.value.MatchString(key) {
 					if !ok {
-						q.tagMatch.missCache.Store(key, struct{}{})
+						q.tagMatch.missCache.Store(tag.Key, struct{}{})
 					}
 					continue
 				}

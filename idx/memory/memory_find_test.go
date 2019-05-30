@@ -12,7 +12,9 @@ import (
 	"time"
 
 	"github.com/grafana/metrictank/cluster"
+	"github.com/grafana/metrictank/idx"
 	"github.com/raintank/schema"
+	goi "github.com/robert-milan/go-object-interning"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -91,6 +93,33 @@ var tagQueries = []tagQuery{
 	{Expressions: []string{"dc=dc1", "host!=~host10[0-9]{2}", "device!=~c.*"}, ExpectedResults: 4000},
 }
 
+func newTestIndex() MemoryIndex {
+	if Partitioned {
+		pidx := &PartitionedMemoryIdx{
+			Partition: make(map[int32]*UnpartitionedMemoryIdx),
+		}
+		partitions := cluster.Manager.GetPartitions()
+		log.Infof("PartitionedMemoryIdx: initializing with partitions: %v", partitions)
+		for _, p := range partitions {
+			pidx.Partition[p] = &UnpartitionedMemoryIdx{
+				defById:     make(map[schema.MKey]*idx.Archive),
+				defByTagSet: make(defByTagSet),
+				tree:        make(map[uint32]*Tree),
+				tags:        make(map[uint32]TagIndex),
+				findCache:   NewFindCache(findCacheSize, findCacheInvalidateQueueSize, findCacheInvalidateMaxSize, findCacheInvalidateMaxWait, findCacheBackoffTime),
+			}
+		}
+		return pidx
+	}
+	return &UnpartitionedMemoryIdx{
+		defById:     make(map[schema.MKey]*idx.Archive),
+		defByTagSet: make(defByTagSet),
+		tree:        make(map[uint32]*Tree),
+		tags:        make(map[uint32]TagIndex),
+		findCache:   NewFindCache(findCacheSize, findCacheInvalidateQueueSize, findCacheInvalidateMaxSize, findCacheInvalidateMaxWait, findCacheBackoffTime),
+	}
+}
+
 func cpuMetrics(dcCount, hostCount, hostOffset, cpuCount int, prefix string) []metric {
 	var series []metric
 	for dc := 0; dc < dcCount; dc++ {
@@ -166,16 +195,21 @@ func InitSmallIndex() {
 	if currentIndex != 1 || currentlyPartitioned != Partitioned {
 		ix = nil
 
+		idx.IdxIntern = nil
+		idx.IdxIntern = goi.NewObjectIntern(goi.NewConfig())
 		// run GC because we only get 4G on CircleCI
 		runtime.GC()
 		cluster.Manager.SetPartitions([]int32{0, 1})
 		partitionCount = 2
 		currentlyPartitioned = Partitioned
-		ix = New()
+		ix = newTestIndex()
 		ix.Init()
 
 		currentIndex = 1
 	} else {
+		idx.IdxIntern = nil
+		idx.IdxIntern = goi.NewObjectIntern(goi.NewConfig())
+		runtime.GC()
 		ix.PurgeFindCache()
 		return
 	}
@@ -213,16 +247,21 @@ func InitLargeIndex() {
 	if currentIndex != 2 || currentlyPartitioned != Partitioned {
 		ix = nil
 
+		idx.IdxIntern = nil
+		idx.IdxIntern = goi.NewObjectIntern(goi.NewConfig())
 		// run GC because we only get 4G on CircleCI
 		runtime.GC()
 		cluster.Manager.SetPartitions([]int32{0, 1, 2, 3, 4, 5, 6, 7})
 		partitionCount = 8
 		currentlyPartitioned = Partitioned
-		ix = New()
+		ix = newTestIndex()
 		ix.Init()
 
 		currentIndex = 2
 	} else {
+		idx.IdxIntern = nil
+		idx.IdxIntern = goi.NewObjectIntern(goi.NewConfig())
+		runtime.GC()
 		ix.PurgeFindCache()
 		return
 	}
@@ -441,7 +480,7 @@ func TestTagSorting(t *testing.T) {
 }
 
 func testTagSorting(t *testing.T) {
-	index := New()
+	index := newTestIndex()
 	index.Init()
 
 	md1 := &schema.MetricData{
@@ -471,21 +510,37 @@ func testTagSorting(t *testing.T) {
 		t.Fatalf("Wrong metric name returned.\nExpected: %s\nGot: %s\n", expected, res[0].Path)
 	}
 
-	md2 := []schema.MetricDefinition{
+	md2 := []idx.MetricDefinition{
 		{
-			Name:       "name2",
-			Tags:       []string{},
+			Tags:       idx.TagKeyValues{},
 			Interval:   10,
 			OrgId:      1,
 			LastUpdate: int64(123),
 		},
 	}
+	md2[0].SetMetricName("name2")
 	md2[0].SetId()
 
 	// set out of order tags after SetId (because that would sort it)
 	// e.g. mimic the case where somebody sent us a MD with an id already set and out-of-order tags
-	md2[0].Tags = []string{"5=a", "1=a", "2=a", "4=a", "3=a"}
-	index.LoadPartition(getPartitionFromName("name2"), md2)
+	var k, v uintptr
+	md2[0].Tags = idx.TagKeyValues{}
+	k, _ = idx.IdxIntern.AddOrGet([]byte("5"), false)
+	v, _ = idx.IdxIntern.AddOrGet([]byte("a"), false)
+	md2[0].Tags.KeyValues = append(md2[0].Tags.KeyValues, idx.TagKeyValue{Key: k, Value: v})
+	k, _ = idx.IdxIntern.AddOrGet([]byte("1"), false)
+	v, _ = idx.IdxIntern.AddOrGet([]byte("a"), false)
+	md2[0].Tags.KeyValues = append(md2[0].Tags.KeyValues, idx.TagKeyValue{Key: k, Value: v})
+	k, _ = idx.IdxIntern.AddOrGet([]byte("2"), false)
+	v, _ = idx.IdxIntern.AddOrGet([]byte("a"), false)
+	md2[0].Tags.KeyValues = append(md2[0].Tags.KeyValues, idx.TagKeyValue{Key: k, Value: v})
+	k, _ = idx.IdxIntern.AddOrGet([]byte("4"), false)
+	v, _ = idx.IdxIntern.AddOrGet([]byte("a"), false)
+	md2[0].Tags.KeyValues = append(md2[0].Tags.KeyValues, idx.TagKeyValue{Key: k, Value: v})
+	k, _ = idx.IdxIntern.AddOrGet([]byte("3"), false)
+	v, _ = idx.IdxIntern.AddOrGet([]byte("a"), false)
+	md2[0].Tags.KeyValues = append(md2[0].Tags.KeyValues, idx.TagKeyValue{Key: k, Value: v})
+	index.LoadPartition(0, md2)
 
 	res, err = index.FindByTag(1, []string{"3=a"}, 0)
 	if err != nil {

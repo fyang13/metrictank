@@ -1,6 +1,9 @@
 package memory
 
 import (
+	"bytes"
+	"crypto/md5"
+	"encoding/binary"
 	"flag"
 	"fmt"
 	"os"
@@ -47,6 +50,11 @@ var (
 	// metric idx.metrics_active is the number of currently known metrics in the index
 	statMetricsActive = stats.NewGauge32("idx.metrics_active")
 
+	// metric idx.memory.intern.memory is the total memory used by the interning layer in bytes by object size
+	statInternMemory = make([]*stats.Gauge64, 256)
+	// metric idx.memory.intern.fragmentation is the total fragmentation percent of the object store used by the interning layer by object size
+	statInternFragmentation = make([]*stats.Gauge32, 256)
+
 	Enabled                      bool
 	matchCacheSize               int
 	maxPruneLockTime             = time.Millisecond * 100
@@ -62,6 +70,14 @@ var (
 	findCacheInvalidateMaxWait   = 5 * time.Second
 	findCacheBackoffTime         = time.Minute
 )
+
+func init() {
+	// instantiate strats for the interning layer/object store
+	for i := 0; i < 256; i++ {
+		statInternMemory[i] = stats.NewGauge64(fmt.Sprintf("idx.memory.intern.memory.%d", i))
+		statInternFragmentation[i] = stats.NewGauge32(fmt.Sprintf("idx.memory.intern.fragmentation.%d", i))
+	}
+}
 
 func ConfigSetup() {
 	memoryIdx := flag.NewFlagSet("memory-idx", flag.ExitOnError)
@@ -104,13 +120,13 @@ func ConfigProcess() {
 
 }
 
-// interface implemented by both UnpartitionedMemoryIdx and PartitionedMemoryIdx
+// MemoryIndex is an interface implemented by both UnpartitionedMemoryIdx and PartitionedMemoryIdx
 // this is needed to support unit tests.
 type MemoryIndex interface {
 	idx.MetricIndex
-	LoadPartition(int32, []schema.MetricDefinition) int
+	LoadPartition(int32, []idx.MetricDefinition) int
 	UpdateArchive(idx.Archive)
-	add(*schema.MetricDefinition) idx.Archive
+	add(*idx.MetricDefinition) idx.Archive
 	idsByTagQuery(uint32, TagQuery) IdSet
 	PurgeFindCache()
 	ForceInvalidationFindCache()
@@ -123,11 +139,12 @@ func New() MemoryIndex {
 	return NewUnpartitionedMemoryIdx()
 }
 
+// Tree is the top level struct in the hierarchical index for a given OrgID
 type Tree struct {
 	Items map[string]*Node // key is the full path of the node.
 }
 
-type IdSet map[schema.MKey]struct{} // set of ids
+type IdSet map[schema.MKey]struct{}
 
 func (ids IdSet) String() string {
 	var res string
@@ -141,10 +158,10 @@ func (ids IdSet) String() string {
 
 }
 
-type TagValue map[string]IdSet    // value -> set of ids
-type TagIndex map[string]TagValue // key -> list of values
+type TagValue map[uintptr]IdSet    // value -> set of ids
+type TagIndex map[uintptr]TagValue // key -> list of values
 
-func (t *TagIndex) addTagId(name, value string, id schema.MKey) {
+func (t *TagIndex) addTagId(name, value uintptr, id schema.MKey) {
 	ti := *t
 	if _, ok := ti[name]; !ok {
 		ti[name] = make(TagValue)
@@ -155,7 +172,7 @@ func (t *TagIndex) addTagId(name, value string, id schema.MKey) {
 	ti[name][value][id] = struct{}{}
 }
 
-func (t *TagIndex) delTagId(name, value string, id schema.MKey) {
+func (t *TagIndex) delTagId(name, value uintptr, id schema.MKey) {
 	ti := *t
 
 	delete(ti[name][value], id)
@@ -168,37 +185,39 @@ func (t *TagIndex) delTagId(name, value string, id schema.MKey) {
 	}
 }
 
-// org id -> nameWithTags -> Set of references to schema.MetricDefinition
-// nameWithTags is the name plus all tags in the <name>;<tag>=<value>... format.
-type defByTagSet map[uint32]map[string]map[*schema.MetricDefinition]struct{}
+// org id -> NameWithTagsHash() -> Map keyed by *idx.MetricDefinition.
+type defByTagSet map[uint32]map[idx.Md5Hash]map[*idx.MetricDefinition]struct{}
 
-func (defs defByTagSet) add(def *schema.MetricDefinition) {
-	var orgDefs map[string]map[*schema.MetricDefinition]struct{}
+func (defs defByTagSet) add(def *idx.MetricDefinition) {
+	var orgDefs map[idx.Md5Hash]map[*idx.MetricDefinition]struct{}
 	var ok bool
 	if orgDefs, ok = defs[def.OrgId]; !ok {
-		orgDefs = make(map[string]map[*schema.MetricDefinition]struct{})
+		orgDefs = make(map[idx.Md5Hash]map[*idx.MetricDefinition]struct{})
 		defs[def.OrgId] = orgDefs
 	}
 
-	fullName := def.NameWithTags()
-	if _, ok = orgDefs[fullName]; !ok {
-		orgDefs[fullName] = make(map[*schema.MetricDefinition]struct{}, 1)
+	hashedName := def.NameWithTagsHash()
+	if _, ok = orgDefs[hashedName]; !ok {
+		orgDefs[hashedName] = make(map[*idx.MetricDefinition]struct{}, 1)
 	}
-	orgDefs[fullName][def] = struct{}{}
+
+	if _, ok = orgDefs[hashedName][def]; !ok {
+		orgDefs[hashedName][def] = struct{}{}
+	}
 }
 
-func (defs defByTagSet) del(def *schema.MetricDefinition) {
-	var orgDefs map[string]map[*schema.MetricDefinition]struct{}
+func (defs defByTagSet) del(def *idx.MetricDefinition) {
+	var orgDefs map[idx.Md5Hash]map[*idx.MetricDefinition]struct{}
 	var ok bool
 	if orgDefs, ok = defs[def.OrgId]; !ok {
 		return
 	}
 
-	fullName := def.NameWithTags()
-	delete(orgDefs[fullName], def)
+	hashedName := def.NameWithTagsHash()
+	delete(orgDefs[hashedName], def)
 
-	if len(orgDefs[fullName]) == 0 {
-		delete(orgDefs, fullName)
+	if len(orgDefs[hashedName]) == 0 {
+		delete(orgDefs, hashedName)
 	}
 
 	if len(orgDefs) == 0 {
@@ -206,14 +225,20 @@ func (defs defByTagSet) del(def *schema.MetricDefinition) {
 	}
 }
 
-func (defs defByTagSet) defs(id uint32, fullName string) map[*schema.MetricDefinition]struct{} {
-	var orgDefs map[string]map[*schema.MetricDefinition]struct{}
+func (defs defByTagSet) defs(id uint32, fullName string) map[*idx.MetricDefinition]struct{} {
+	var orgDefs map[idx.Md5Hash]map[*idx.MetricDefinition]struct{}
 	var ok bool
 	if orgDefs, ok = defs[id]; !ok {
 		return nil
 	}
 
-	return orgDefs[fullName]
+	md5Sum := md5.Sum(bytes.NewBufferString(fullName).Bytes())
+	hashedName := idx.Md5Hash{
+		Upper: binary.LittleEndian.Uint64(md5Sum[:8]),
+		Lower: binary.LittleEndian.Uint64(md5Sum[8:]),
+	}
+
+	return orgDefs[hashedName]
 }
 
 type Node struct {
@@ -251,20 +276,45 @@ type UnpartitionedMemoryIdx struct {
 	defByTagSet defByTagSet
 	tags        map[uint32]TagIndex // by orgId
 
+	// used to reduce contention
 	findCache *FindCache
+
+	// used to stop interning layer stats reporting
+	shutdown chan struct{}
 }
 
 func NewUnpartitionedMemoryIdx() *UnpartitionedMemoryIdx {
-	m := UnpartitionedMemoryIdx{
+	umi := &UnpartitionedMemoryIdx{
 		defById:     make(map[schema.MKey]*idx.Archive),
 		defByTagSet: make(defByTagSet),
 		tree:        make(map[uint32]*Tree),
 		tags:        make(map[uint32]TagIndex),
+		shutdown:    make(chan struct{}),
 	}
 	if findCacheSize > 0 {
-		m.findCache = NewFindCache(findCacheSize, findCacheInvalidateQueueSize, findCacheInvalidateMaxSize, findCacheInvalidateMaxWait, findCacheBackoffTime)
+		umi.findCache = NewFindCache(findCacheSize, findCacheInvalidateQueueSize, findCacheInvalidateMaxSize, findCacheInvalidateMaxWait, findCacheBackoffTime)
 	}
-	return &m
+
+	// gather memory and fragmentation statistics on the object store every minute
+	go func(shutdown chan struct{}) {
+		for {
+			select {
+			case <-shutdown:
+				return
+			default:
+				umi.Lock()
+				for _, internMemStat := range idx.IdxIntern.MemStatsPerPool() {
+					statInternMemory[internMemStat.ObjSize].SetUint64(internMemStat.MemUsed)
+				}
+				for _, internFragStat := range idx.IdxIntern.FragStatsPerPool() {
+					statInternFragmentation[internFragStat.ObjSize].SetUint32(uint32(100 - (internFragStat.FragPercent * 100)))
+				}
+				umi.Unlock()
+			}
+			time.Sleep(time.Minute)
+		}
+	}(umi.shutdown)
+	return umi
 }
 
 func (m *UnpartitionedMemoryIdx) Init() error {
@@ -272,6 +322,7 @@ func (m *UnpartitionedMemoryIdx) Init() error {
 }
 
 func (m *UnpartitionedMemoryIdx) Stop() {
+	m.shutdown <- struct{}{}
 	return
 }
 
@@ -337,11 +388,16 @@ func (m *UnpartitionedMemoryIdx) AddOrUpdate(mkey schema.MKey, data *schema.Metr
 	}
 
 	m.RUnlock()
+
+	def, err := idx.MetricDefinitionFromMetricDataWithMKey(mkey, data)
+	if err != nil {
+		return idx.Archive{}, 0, false
+	}
+	def.Partition = partition
+
 	m.Lock()
 	defer m.Unlock()
 
-	def := schema.MetricDefinitionFromMetricData(data)
-	def.Partition = partition
 	archive := m.add(def)
 	statMetricsActive.Inc()
 	statAddDuration.Value(time.Since(pre))
@@ -366,28 +422,20 @@ func (m *UnpartitionedMemoryIdx) UpdateArchive(archive idx.Archive) {
 // indexTags reads the tags of a given metric definition and creates the
 // corresponding tag index entries to refer to it. It assumes a lock is
 // already held.
-func (m *UnpartitionedMemoryIdx) indexTags(def *schema.MetricDefinition) {
+func (m *UnpartitionedMemoryIdx) indexTags(def *idx.MetricDefinition) {
 	tags, ok := m.tags[def.OrgId]
 	if !ok {
 		tags = make(TagIndex)
 		m.tags[def.OrgId] = tags
 	}
 
-	for _, tag := range def.Tags {
-		tagSplits := strings.SplitN(tag, "=", 2)
-		if len(tagSplits) < 2 {
-			// should never happen because every tag in the index
-			// must have a valid format
-			invalidTag.Inc()
-			log.Errorf("memory-idx: Tag %q of id %q has an invalid format", tag, def.Id)
-			continue
-		}
-
-		tagName := tagSplits[0]
-		tagValue := tagSplits[1]
-		tags.addTagId(tagName, tagValue, def.Id)
+	for _, tag := range def.Tags.KeyValues {
+		tags.addTagId(tag.Key, tag.Value, def.Id)
 	}
-	tags.addTagId("name", def.Name, def.Id)
+	// TODO: add special case to handle name and intern the entire thing
+	nameKey, _ := idx.IdxIntern.AddOrGet([]byte("name"), false)
+	nameValue, _ := idx.IdxIntern.AddOrGet([]byte(def.Name.String()), false)
+	tags.addTagId(nameKey, nameValue, def.Id)
 
 	m.defByTagSet.add(def)
 }
@@ -397,52 +445,45 @@ func (m *UnpartitionedMemoryIdx) indexTags(def *schema.MetricDefinition) {
 // a return value of "false" means there was an error and the deindexing was
 // unsuccessful, "true" means the indexing was at least partially or completely
 // successful
-func (m *UnpartitionedMemoryIdx) deindexTags(tags TagIndex, def *schema.MetricDefinition) bool {
-	for _, tag := range def.Tags {
-		tagSplits := strings.SplitN(tag, "=", 2)
-		if len(tagSplits) < 2 {
-			// should never happen because every tag in the index
-			// must have a valid format
-			invalidTag.Inc()
-			log.Errorf("memory-idx: Tag %q of id %q has an invalid format", tag, def.Id)
-			continue
-		}
-
-		tagName := tagSplits[0]
-		tagValue := tagSplits[1]
-		tags.delTagId(tagName, tagValue, def.Id)
+func (m *UnpartitionedMemoryIdx) deindexTags(tags TagIndex, def *idx.MetricDefinition) bool {
+	for _, tag := range def.Tags.KeyValues {
+		tags.delTagId(tag.Key, tag.Value, def.Id)
 	}
 
-	tags.delTagId("name", def.Name, def.Id)
+	nameKey, _ := idx.IdxIntern.GetPtrFromByte([]byte("name"))
+	nameValue, _ := idx.IdxIntern.GetPtrFromByte([]byte(def.Name.String()))
+	tags.delTagId(nameKey, nameValue, def.Id)
 
 	m.defByTagSet.del(def)
 
 	return true
 }
 
-// Used to rebuild the index from an existing set of metricDefinitions for a specific paritition.
-func (m *UnpartitionedMemoryIdx) LoadPartition(partition int32, defs []schema.MetricDefinition) int {
+// LoadPartition is used to rebuild the index from an existing set of metricDefinitions for a specific paritition.
+func (m *UnpartitionedMemoryIdx) LoadPartition(partition int32, defs []idx.MetricDefinition) int {
 	// UnpartitionedMemoryIdx isnt partitioned, so just ignore the partition passed and call Load()
 	return m.Load(defs)
 }
 
-// Used to rebuild the index from an existing set of metricDefinitions.
-func (m *UnpartitionedMemoryIdx) Load(defs []schema.MetricDefinition) int {
+// Load is used to rebuild the index from an existing set of metricDefinitions.
+func (m *UnpartitionedMemoryIdx) Load(defs []idx.MetricDefinition) int {
 	m.Lock()
 	defer m.Unlock()
 	var pre time.Time
 	var num int
 	for i := range defs {
 		def := &defs[i]
+		nDef := *def
 		pre = time.Now()
 		if _, ok := m.defById[def.Id]; ok {
 			continue
 		}
 
-		m.add(def)
+		m.add(&nDef)
 
 		if TagSupport {
-			m.indexTags(def)
+			// create new def to avoid holding open the backing array of defs which is passed up from the persistent index
+			m.indexTags(&nDef)
 		}
 
 		// as we are loading the metricDefs from a persistent store, set the lastSave
@@ -458,20 +499,19 @@ func (m *UnpartitionedMemoryIdx) Load(defs []schema.MetricDefinition) int {
 	return num
 }
 
-func (m *UnpartitionedMemoryIdx) add(def *schema.MetricDefinition) idx.Archive {
+func (m *UnpartitionedMemoryIdx) add(def *idx.MetricDefinition) idx.Archive {
 	path := def.NameWithTags()
 	schemaId, _ := mdata.MatchSchema(path, def.Interval)
 	aggId, _ := mdata.MatchAgg(path)
 	irId, _ := IndexRules.Match(path)
-
 	archive := &idx.Archive{
-		MetricDefinition: *def,
+		MetricDefinition: def,
 		SchemaId:         schemaId,
 		AggId:            aggId,
 		IrId:             irId,
 	}
 
-	if TagSupport && len(def.Tags) > 0 {
+	if TagSupport && len(def.Tags.KeyValues) > 0 {
 		if _, ok := m.defById[def.Id]; !ok {
 			m.defById[def.Id] = archive
 			statAdd.Inc()
@@ -558,6 +598,8 @@ func (m *UnpartitionedMemoryIdx) add(def *schema.MetricDefinition) idx.Archive {
 	return *archive
 }
 
+// Get returns an idx.Archive that matches the supplied schema.MKey.
+// Upon failure it returns an empty idx.Archive
 func (m *UnpartitionedMemoryIdx) Get(id schema.MKey) (idx.Archive, bool) {
 	pre := time.Now()
 	m.RLock()
@@ -617,13 +659,25 @@ func (m *UnpartitionedMemoryIdx) TagDetails(orgId uint32, key, filter string, fr
 		return nil, nil
 	}
 
-	values, ok := tags[key]
+	keyPtr, err := idx.IdxIntern.GetPtrFromByte([]byte(key))
+	if err != nil {
+		log.Error("memory-idx: Failed to retrieve interned string for tag key: ", err)
+		internError.Inc()
+		return nil, err
+	}
+	values, ok := tags[keyPtr]
 	if !ok {
 		return nil, nil
 	}
 
 	res := make(map[string]uint64)
-	for value, ids := range values {
+	for valuePtr, ids := range values {
+		value, err := idx.IdxIntern.GetStringFromPtr(valuePtr)
+		if err != nil {
+			log.Error("memory-idx: Failed to retrieve interned string for tag value: ", err)
+			internError.Inc()
+			continue
+		}
 		if re != nil && !re.MatchString(value) {
 			continue
 		}
@@ -711,7 +765,13 @@ func (m *UnpartitionedMemoryIdx) FindTags(orgId uint32, prefix string, expressio
 		}
 
 		tagsSorted := make([]string, 0, len(tags))
-		for tag := range tags {
+		for tagPtr := range tags {
+			tag, err := idx.IdxIntern.GetStringFromPtr(tagPtr)
+			if err != nil {
+				log.Error("memory-idx: Failed to retrieve interned string for tag key: ", err)
+				internError.Inc()
+				continue
+			}
 			if !strings.HasPrefix(tag, prefix) {
 				continue
 			}
@@ -782,7 +842,6 @@ func (m *UnpartitionedMemoryIdx) FindTagValues(orgId uint32, tag, prefix string,
 
 		ids := query.Run(tags, m.defById)
 		valueMap := make(map[string]struct{})
-		prefix := tag + "="
 		for id := range ids {
 			var ok bool
 			var def *idx.Archive
@@ -796,15 +855,26 @@ func (m *UnpartitionedMemoryIdx) FindTagValues(orgId uint32, tag, prefix string,
 
 			// special case if the tag to complete values for is "name"
 			if tag == "name" {
-				valueMap[def.Name] = struct{}{}
+				valueMap[def.Name.String()] = struct{}{}
 			} else {
-				for _, t := range def.Tags {
-					if !strings.HasPrefix(t, prefix) {
+				for _, t := range def.Tags.KeyValues {
+					key, err := idx.IdxIntern.GetStringFromPtr(t.Key)
+					if err != nil {
+						log.Error("memory-idx: Failed to retrieve interned string for tag key: ", err)
+						internError.Inc()
+						continue
+					}
+					if key != tag {
 						continue
 					}
 
-					// keep the value after "=", that's why "+1"
-					valueMap[t[len(prefix):]] = struct{}{}
+					value, err := idx.IdxIntern.GetStringFromPtr(t.Value)
+					if err != nil {
+						log.Error("memory-idx: Failed to retrieve interned string for tag value: ", err)
+						internError.Inc()
+						continue
+					}
+					valueMap[value] = struct{}{}
 				}
 			}
 		}
@@ -822,13 +892,25 @@ func (m *UnpartitionedMemoryIdx) FindTagValues(orgId uint32, tag, prefix string,
 			return nil, nil
 		}
 
-		vals, ok := tags[tag]
+		tagPtr, err := idx.IdxIntern.GetPtrFromByte([]byte(tag))
+		if err != nil {
+			log.Error("memory-idx: Failed to retrieve uintptr for interned tag key: ", err)
+			internError.Inc()
+			return nil, nil
+		}
+		vals, ok := tags[tagPtr]
 		if !ok {
 			return nil, nil
 		}
 
 		res = make([]string, 0, len(vals))
-		for val := range vals {
+		for valPtr := range vals {
+			val, err := idx.IdxIntern.GetStringFromPtr(valPtr)
+			if err != nil {
+				log.Error("memory-idx: Failed to retrieve interned string for tag value: ", err)
+				internError.Inc()
+				continue
+			}
 			if !strings.HasPrefix(val, prefix) {
 				continue
 			}
@@ -883,7 +965,13 @@ func (m *UnpartitionedMemoryIdx) Tags(orgId uint32, filter string, from int64) (
 		res = make([]string, 0, len(tags))
 	}
 
-	for tag := range tags {
+	for tagPtr := range tags {
+		tag, err := idx.IdxIntern.GetStringFromPtr(tagPtr)
+		if err != nil {
+			log.Error("memory-idx: Failed to retrieve interned string for tag key: ", err)
+			internError.Inc()
+			continue
+		}
 		// filter by pattern if one was given
 		if re != nil && !re.MatchString(tag) {
 			continue
@@ -900,7 +988,13 @@ func (m *UnpartitionedMemoryIdx) Tags(orgId uint32, filter string, from int64) (
 }
 
 func (m *UnpartitionedMemoryIdx) hasOneMetricFrom(tags TagIndex, tag string, from int64) bool {
-	for _, ids := range tags[tag] {
+	tagPtr, err := idx.IdxIntern.GetPtrFromByte([]byte(tag))
+	if err != nil {
+		log.Error("memory-idx: Failed to retrieve uintptr for interned tag key: ", err)
+		internError.Inc()
+		return false
+	}
+	for _, ids := range tags[tagPtr] {
 		for id := range ids {
 			def, ok := m.defById[id]
 			if !ok {
@@ -1046,7 +1140,7 @@ func (m *UnpartitionedMemoryIdx) Find(orgId uint32, pattern string, from int64) 
 						log.Debugf("memory-idx: from is %d, so skipping %s which has LastUpdate %d", from, def.Id, atomic.LoadInt64(&def.LastUpdate))
 						continue
 					}
-					log.Debugf("memory-idx: Find: adding to path %s archive id=%s name=%s int=%d schemaId=%d aggId=%d irId=%d lastSave=%d", n.Path, def.Id, def.Name, def.Interval, def.SchemaId, def.AggId, def.IrId, def.LastSave)
+					log.Debugf("memory-idx: Find: adding to path %s archive id=%s name=%s int=%d schemaId=%d aggId=%d irId=%d lastSave=%d", n.Path, def.Id, def.Name.String(), def.Interval, def.SchemaId, def.AggId, def.IrId, def.LastSave)
 					idxNode.Defs = append(idxNode.Defs, *def)
 				}
 				if len(idxNode.Defs) == 0 {
@@ -1203,7 +1297,14 @@ func (m *UnpartitionedMemoryIdx) DeleteTagged(orgId uint32, paths []string) ([]i
 
 	m.Lock()
 	defer m.Unlock()
-	return m.deleteTaggedByIdSet(orgId, ids), nil
+	deleted := m.deleteTaggedByIdSet(orgId, ids)
+
+	// this is a special case where the MetricDefinitions need to be
+	// released outside of the normal Delete() path.
+	for _, arc := range deleted {
+		idx.InternReleaseMetricDefinition(*arc.MetricDefinition)
+	}
+	return deleted, nil
 }
 
 // deleteTaggedByIdSet deletes a map of ids from the tag index and also the DefByIds
@@ -1224,7 +1325,7 @@ func (m *UnpartitionedMemoryIdx) deleteTaggedByIdSet(orgId uint32, ids IdSet) []
 			// while we switched from read to write lock
 			continue
 		}
-		if !m.deindexTags(tags, &def.MetricDefinition) {
+		if !m.deindexTags(tags, def.MetricDefinition) {
 			continue
 		}
 		deletedDefs = append(deletedDefs, *def)
@@ -1236,7 +1337,7 @@ func (m *UnpartitionedMemoryIdx) deleteTaggedByIdSet(orgId uint32, ids IdSet) []
 	return deletedDefs
 }
 
-func (m *UnpartitionedMemoryIdx) Delete(orgId uint32, pattern string) ([]idx.Archive, error) {
+func (m *UnpartitionedMemoryIdx) DeletePersistent(orgId uint32, pattern string) ([]idx.Archive, error) {
 	var deletedDefs []idx.Archive
 	pre := time.Now()
 	m.Lock()
@@ -1276,6 +1377,11 @@ func (m *UnpartitionedMemoryIdx) Delete(orgId uint32, pattern string) ([]idx.Arc
 	statDeleteDuration.Value(time.Since(pre))
 
 	return deletedDefs, nil
+}
+
+func (m *UnpartitionedMemoryIdx) Delete(orgId uint32, pattern string) (int, error) {
+	arcs, err := m.DeletePersistent(orgId, pattern)
+	return len(arcs), err
 }
 
 func (m *UnpartitionedMemoryIdx) delete(orgId uint32, n *Node, deleteEmptyParents, deleteChildren bool) []idx.Archive {
@@ -1414,13 +1520,13 @@ DEFS:
 			continue DEFS
 		}
 
-		if len(def.Tags) == 0 {
+		if len(def.Tags.KeyValues) == 0 {
 			tree, ok := m.tree[def.OrgId]
 			if !ok {
 				continue DEFS
 			}
 
-			n, ok := tree.Items[def.Name]
+			n, ok := tree.Items[def.Name.String()]
 			if !ok || !n.Leaf() {
 				continue DEFS
 			}

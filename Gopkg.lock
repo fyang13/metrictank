@@ -331,6 +331,14 @@
   revision = "7a1aae0695d90c7ce662097c9589dfe1ae3c4f47"
 
 [[projects]]
+  branch = "master"
+  digest = "1:e03c439efbb9b1c8e3d0e79f79009326ca7d0c5d87d018e4b1000ad284b6444e"
+  name = "github.com/grafana/go-generic-object-store"
+  packages = ["."]
+  pruneopts = "NUT"
+  revision = "621898ab1f81b74f59b474c62a6ee76dc24f3e43"
+
+[[projects]]
   digest = "1:a191ed8e21025522d5857d14c3ec0a6513f83bea2ff45967f301fb701f3849dd"
   name = "github.com/grpc-ecosystem/grpc-gateway"
   packages = [
@@ -690,6 +698,14 @@
   revision = "e2704e165165ec55d062f5919b4b29494e9fa790"
 
 [[projects]]
+  branch = "master"
+  digest = "1:d66d5dd414213a32d34f8f654e8cba67f01f29d152253477eb5143e703a96b01"
+  name = "github.com/robert-milan/go-object-interning"
+  packages = ["."]
+  pruneopts = "NUT"
+  revision = "f2205247749b110fc9b7c150563bde47b4bbcae6"
+
+[[projects]]
   digest = "1:c5741d3d03a06220bcca801547f28de803103249b739eb5537e54b77e89f435a"
   name = "github.com/rs/cors"
   packages = ["."]
@@ -761,6 +777,14 @@
   version = "v1.1.0"
 
 [[projects]]
+  branch = "master"
+  digest = "1:a62c8b826167e33e30b613271688b7ce0bd63e500040cb3b710ce845b2f64da4"
+  name = "github.com/tmthrgd/shoco"
+  packages = ["."]
+  pruneopts = "NUT"
+  revision = "9d48cea723d956736cddbeb2b82d3f8c19f1cb73"
+
+[[projects]]
   digest = "1:87dee780f88f86f300bbd90116e933347cf4a3c65c1960072d412597a8896d50"
   name = "github.com/uber/jaeger-client-go"
   packages = [
@@ -795,6 +819,13 @@
   revision = "c48167d9cae5887393dd5e61efd06a4a48b7fbb3"
   source = "https://github.com/jaegertracing/jaeger-lib.git"
   version = "v1.2.1"
+
+[[projects]]
+  digest = "1:0f4299df39f2e222cdd1b802126a7ae9cadcb4f11f65d657adb48a4e07c9bfb7"
+  name = "github.com/willf/bitset"
+  packages = ["."]
+  pruneopts = "NUT"
+  revision = "3fb80c4041d4fce1c027ff1c416cca3e0dccd97e"
 
 [[projects]]
   digest = "1:d04de18a0e0bf8fcdb79e8dc755c9b15dbe7f1b2ea3f8fbf11e55ea2d26ac182"
@@ -1071,6 +1102,7 @@
     "github.com/raintank/met/helper",
     "github.com/raintank/schema",
     "github.com/raintank/schema/msg",
+    "github.com/robert-milan/go-object-interning",
     "github.com/rs/cors",
     "github.com/sergi/go-diff/diffmatchpatch",
     "github.com/sirupsen/logrus",

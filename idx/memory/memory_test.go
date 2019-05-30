@@ -148,7 +148,12 @@ func printMemUsage(t *testing.T) {
 	t.Logf("TotalAlloc = \t\t%v MB\t\t %v KB\t %v B\n", (m.TotalAlloc / 1024 / 1024), (m.TotalAlloc / 1024), m.TotalAlloc)
 	t.Logf("Sys = \t\t\t%v MB\t\t %v KB\t %v B\n", (m.Sys / 1024 / 1024), (m.Sys / 1024), m.Sys)
 	t.Logf("Live Heap Objects = \t%v\n", (m.Mallocs - m.Frees))
-	t.Logf("NumGC = \t\t%v\n\n\n", m.NumGC)
+	t.Logf("NumGC = \t\t%v\n\n", m.NumGC)
+	memTotalObjectStore, err := idx.IdxIntern.MemStatsTotal()
+	if err == nil {
+		t.Logf("Total Memory Used By Object Store = \t\t%v MB\t\t %v KB\t %v B\n", (memTotalObjectStore / 1024 / 1024), (memTotalObjectStore / 1024), memTotalObjectStore)
+		t.Logf("Total Memory Used = \t\t\t\t%v MB\t\t %v KB\t %v B\n\n\n", ((memTotalObjectStore + m.HeapAlloc) / 1024 / 1024), ((memTotalObjectStore + m.HeapAlloc) / 1024), memTotalObjectStore+m.HeapAlloc)
+	}
 }
 
 // withAndWithoutTagSupport calls a test with the TagSupprt setting
@@ -502,7 +507,7 @@ func testDeleteNodeWith100kChildren(t *testing.T) {
 
 	Convey("when deleting 100k series", t, func() {
 		type resp struct {
-			defs []idx.Archive
+			defs int
 			err  error
 		}
 		done := make(chan *resp)
@@ -519,7 +524,7 @@ func testDeleteNodeWith100kChildren(t *testing.T) {
 			t.Fatal("deleting series took more then 10seconds.")
 		case response := <-done:
 			So(response.err, ShouldBeNil)
-			So(response.defs, ShouldHaveLength, 100000)
+			So(response.defs, ShouldEqual, 100000)
 		}
 	})
 }
@@ -631,7 +636,7 @@ func testMixedBranchLeafDelete(t *testing.T) {
 	}
 
 	Convey("when deleting mixed leaf/branch", t, func() {
-		defs, err := ix.Delete(1, "a.b.c")
+		defs, err := ix.DeletePersistent(1, "a.b.c")
 		So(err, ShouldBeNil)
 		So(defs, ShouldHaveLength, 2)
 		deletedIds := make([]schema.MKey, len(defs))
@@ -654,7 +659,7 @@ func testMixedBranchLeafDelete(t *testing.T) {
 		})
 	})
 	Convey("when deleting from branch", t, func() {
-		defs, err := ix.Delete(1, "a.b.c2.d.*")
+		defs, err := ix.DeletePersistent(1, "a.b.c2.d.*")
 		So(err, ShouldBeNil)
 		So(defs, ShouldHaveLength, 1)
 		if defs[0].Id != mkeys[3] {
@@ -760,12 +765,12 @@ func testPruneTaggedSeries(t *testing.T) {
 		// to a more recent time that will survive the next prune
 		var data *schema.MetricData
 		for _, def := range defs {
-			if strings.HasPrefix(def.Name, "longterm") {
+			if strings.HasPrefix(def.Name.String(), "longterm") {
 				data = &schema.MetricData{
-					Name:     def.Name,
+					Name:     def.Name.String(),
 					Id:       def.Id.String(),
-					Tags:     def.Tags,
-					Mtype:    def.Mtype,
+					Tags:     def.Tags.Strings(),
+					Mtype:    def.Mtype(),
 					OrgId:    1,
 					Interval: 10,
 					Time:     100,
@@ -940,7 +945,7 @@ func testPrune(t *testing.T) {
 		defs := ix.List(1)
 		So(defs, ShouldHaveLength, 5)
 		data := &schema.MetricData{
-			Name:     defs[0].Name,
+			Name:     defs[0].Name.String(),
 			Id:       defs[0].Id.String(),
 			OrgId:    1,
 			Interval: 30,
@@ -1013,7 +1018,7 @@ func testMemoryIndexHeapUsageWithTags(t *testing.T, unique float32, count int) {
 	// turn tag support on
 	TagSupport = true
 
-	globalMemoryIndex = New()
+	globalMemoryIndex = newTestIndex()
 	globalMemoryIndex.Init()
 
 	series := getMetricDataWithCustomTags(1, 2, count, 10, "somekindof.longereven.metricname.butinstead.ofashorterone.bunchofthingsandstuff", unique)
@@ -1208,17 +1213,19 @@ func testMatchSchemaWithTags(t *testing.T) {
 	ix := New()
 	ix.Init()
 
-	data := make([]*schema.MetricDefinition, 10)
+	data := make([]*idx.MetricDefinition, 10)
 	archives := make([]idx.Archive, 10)
 	for i := 0; i < 10; i++ {
 		name := fmt.Sprintf("some.id.of.a.metric.%d", i)
-		data[i] = &schema.MetricDefinition{
-			Name:      name,
+		data[i] = &idx.MetricDefinition{
 			OrgId:     1,
 			Interval:  1,
-			Tags:      []string{fmt.Sprintf("tag1=value%d", i), "tag2=othervalue"},
 			Partition: getPartitionFromName(name),
 		}
+		tags := []string{fmt.Sprintf("tag1=value%d", i), "tag2=othervalue"}
+		data[i].SetTags(tags)
+		data[i].SetMetricName(name)
+
 		data[i].SetId()
 		archives[i] = ix.add(data[i])
 	}

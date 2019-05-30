@@ -6,9 +6,23 @@ import (
 	"time"
 
 	"github.com/raintank/schema"
+	goi "github.com/robert-milan/go-object-interning"
 )
 
 var OrgIdPublic = uint32(0)
+
+// IdxIntern is a pointer into the object interning layer for the index
+//
+// Default config does not use compression
+var IdxIntern = goi.NewObjectIntern(goi.NewConfig())
+
+//msgp:ignore Md5Hash
+
+// Md5Hash is a structure for more compactly storing an md5 hash than using a string
+type Md5Hash struct {
+	Upper uint64
+	Lower uint64
+}
 
 //go:generate msgp
 type Node struct {
@@ -19,7 +33,7 @@ type Node struct {
 }
 
 type Archive struct {
-	schema.MetricDefinition
+	*MetricDefinition
 	SchemaId uint16 // index in mdata.schemas (not persisted)
 	AggId    uint16 // index in mdata.aggregations (not persisted)
 	IrId     uint16 // index in mdata.indexrules (not persisted)
@@ -28,11 +42,13 @@ type Archive struct {
 
 // used primarily by tests, for convenience
 func NewArchiveBare(name string) Archive {
-	return Archive{
-		MetricDefinition: schema.MetricDefinition{
-			Name: name,
-		},
+	arc := Archive{}
+	arc.MetricDefinition = new(MetricDefinition)
+	err := arc.MetricDefinition.SetMetricName(name)
+	if err != nil {
+		return Archive{}
 	}
+	return arc
 }
 
 // The MetricIndex interface supports Graphite style queries.
@@ -70,8 +86,12 @@ type MetricIndex interface {
 	// If the pattern matches a branch node, then
 	// all leaf nodes on that branch are deleted. So if the pattern is
 	// "*", all items in the index are deleted.
-	// It returns a copy of all of the Archives deleted.
-	Delete(orgId uint32, pattern string) ([]Archive, error)
+	// It returns the number of Archives that were deleted.
+	Delete(orgId uint32, pattern string) (int, error)
+
+	// DeletePersistent deletes items from the index
+	// It returns the deleted items in a []idx.Archive
+	DeletePersistent(orgId uint32, pattern string) ([]Archive, error)
 
 	// Find searches the index for matching nodes.
 	// * orgId describes the org to search in (public data in orgIdPublic is automatically included)
@@ -125,4 +145,20 @@ type MetricIndex interface {
 	// DeleteTagged deletes the specified series from the tag index and also the
 	// DefById index.
 	DeleteTagged(orgId uint32, paths []string) ([]Archive, error)
+}
+
+// InternReleaseMetricDefinition releases all previously acquired strings
+// into the interning layer so that their reference count can be
+// decreased by 1 and they can eventually be deleted
+func InternReleaseMetricDefinition(md MetricDefinition) {
+	for _, tag := range md.Tags.KeyValues {
+		IdxIntern.Delete(tag.Key)
+		IdxIntern.Delete(tag.Value)
+	}
+
+	for _, id := range md.Name.Nodes() {
+		IdxIntern.Delete(id)
+	}
+
+	IdxIntern.DeleteByString(md.Unit)
 }

@@ -42,6 +42,10 @@ unused-packages = true
   revision = "08e90462da344fbb3880e8e47a0ddacc37508579"
 
 [[constraint]]
+  branch = "master"
+  name = "github.com/robert-milan/go-object-interning"
+
+[[constraint]]
   name = "github.com/alyu/configparser"
   branch = "master"
 

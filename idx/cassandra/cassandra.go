@@ -52,7 +52,7 @@ var (
 )
 
 type writeReq struct {
-	def      *schema.MetricDefinition
+	def      *idx.MetricDefinition
 	recvTime time.Time
 }
 
@@ -318,7 +318,7 @@ func (c *CasIdx) updateCassandra(now uint32, inMemory bool, archive idx.Archive,
 	// then perform a blocking save.
 	if archive.LastSave < (now - c.updateInterval32 - c.updateInterval32/2) {
 		log.Debugf("cassandra-idx: updating def %s in index.", archive.MetricDefinition.Id)
-		c.writeQueue <- writeReq{recvTime: time.Now(), def: &archive.MetricDefinition}
+		c.writeQueue <- writeReq{recvTime: time.Now(), def: archive.MetricDefinition}
 		archive.LastSave = now
 		c.MemoryIndex.UpdateArchive(archive)
 	} else {
@@ -329,7 +329,7 @@ func (c *CasIdx) updateCassandra(now uint32, inMemory bool, archive idx.Archive,
 		// lastSave timestamp become more then 1.5 x UpdateInterval, in which case we will
 		// do a blocking write to the queue.
 		select {
-		case c.writeQueue <- writeReq{recvTime: time.Now(), def: &archive.MetricDefinition}:
+		case c.writeQueue <- writeReq{recvTime: time.Now(), def: archive.MetricDefinition}:
 			archive.LastSave = now
 			c.MemoryIndex.UpdateArchive(archive)
 		default:
@@ -348,7 +348,7 @@ func (c *CasIdx) rebuildIndex() {
 	var wg sync.WaitGroup
 	defPool := sync.Pool{
 		New: func() interface{} {
-			return []schema.MetricDefinition{}
+			return []idx.MetricDefinition{}
 		},
 	}
 	var num uint32
@@ -356,7 +356,7 @@ func (c *CasIdx) rebuildIndex() {
 		wg.Add(1)
 		go func(p int32) {
 			gate <- struct{}{}
-			defs := defPool.Get().([]schema.MetricDefinition)
+			defs := defPool.Get().([]idx.MetricDefinition)
 			defer func() {
 				defPool.Put(defs[:0])
 				wg.Done()
@@ -370,13 +370,12 @@ func (c *CasIdx) rebuildIndex() {
 	log.Infof("cassandra-idx: Rebuilding Memory Index Complete. Imported %d. Took %s", num, time.Since(pre))
 }
 
-func (c *CasIdx) Load(defs []schema.MetricDefinition, now time.Time) []schema.MetricDefinition {
+func (c *CasIdx) Load(defs []idx.MetricDefinition, now time.Time) []idx.MetricDefinition {
 	iter := c.session.Query("SELECT id, orgid, partition, name, interval, unit, mtype, tags, lastupdate from metric_idx").Iter()
 	return c.load(defs, iter, now)
 }
 
-// LoadPartitions appends MetricDefinitions from the given partitions to defs and returns the modified defs, honoring pruning settings relative to now
-func (c *CasIdx) LoadPartitions(partitions []int32, defs []schema.MetricDefinition, now time.Time) []schema.MetricDefinition {
+func (c *CasIdx) LoadPartitions(partitions []int32, defs []idx.MetricDefinition, now time.Time) []idx.MetricDefinition {
 	placeholders := make([]string, len(partitions))
 	for i, p := range partitions {
 		placeholders[i] = strconv.Itoa(int(p))
@@ -386,9 +385,8 @@ func (c *CasIdx) LoadPartitions(partitions []int32, defs []schema.MetricDefiniti
 	return c.load(defs, iter, now)
 }
 
-// load appends MetricDefinitions from the iterator to defs and returns the modified defs, honoring pruning settings relative to now
-func (c *CasIdx) load(defs []schema.MetricDefinition, iter cqlIterator, now time.Time) []schema.MetricDefinition {
-	defsByNames := make(map[string][]*schema.MetricDefinition)
+func (c *CasIdx) load(defs []idx.MetricDefinition, iter cqlIterator, now time.Time) []idx.MetricDefinition {
+	defsByNames := make(map[string][]*idx.MetricDefinition)
 	var id, name, unit, mtype string
 	var orgId, interval int
 	var partition int32
@@ -404,17 +402,21 @@ func (c *CasIdx) load(defs []schema.MetricDefinition, iter cqlIterator, now time
 			orgId = int(idx.OrgIdPublic)
 		}
 
-		mdef := &schema.MetricDefinition{
+		mdef := &idx.MetricDefinition{
 			Id:         mkey,
 			OrgId:      uint32(orgId),
 			Partition:  partition,
-			Name:       name,
 			Interval:   interval,
-			Unit:       unit,
-			Mtype:      mtype,
-			Tags:       tags,
 			LastUpdate: lastupdate,
 		}
+		err = mdef.SetMetricName(name)
+		if err != nil {
+			continue
+		}
+		mdef.SetUnit(unit)
+		mdef.SetMType(mtype)
+		mdef.SetTags(tags)
+
 		nameWithTags := mdef.NameWithTags()
 		defsByNames[nameWithTags] = append(defsByNames[nameWithTags], mdef)
 	}
@@ -446,8 +448,8 @@ NAMES:
 
 // ArchiveDefs writes each of the provided defs to the archive table and
 // then deletes the defs from the metric_idx table.
-func (c *CasIdx) ArchiveDefs(defs []schema.MetricDefinition) (int, error) {
-	defChan := make(chan *schema.MetricDefinition, c.cfg.numConns)
+func (c *CasIdx) ArchiveDefs(defs []idx.MetricDefinition) (int, error) {
+	defChan := make(chan *idx.MetricDefinition, c.cfg.numConns)
 	g, ctx := errgroup.WithContext(context.Background())
 
 	// keep track of how many defs were successfully archived.
@@ -528,11 +530,11 @@ func (c *CasIdx) processWriteQueue() {
 				req.def.Id.String(),
 				req.def.OrgId,
 				req.def.Partition,
-				req.def.Name,
+				req.def.Name.String(),
 				req.def.Interval,
 				req.def.Unit,
-				req.def.Mtype,
-				req.def.Tags,
+				req.def.Mtype(),
+				req.def.Tags.Strings(),
 				req.def.LastUpdate).Exec(); err != nil {
 
 				statQueryInsertFail.Inc()
@@ -558,7 +560,7 @@ func (c *CasIdx) processWriteQueue() {
 	c.wg.Done()
 }
 
-func (c *CasIdx) addDefToArchive(def schema.MetricDefinition) error {
+func (c *CasIdx) addDefToArchive(def idx.MetricDefinition) error {
 	insertQry := `INSERT INTO metric_idx_archive (id, orgid, partition, name, interval, unit, mtype, tags, lastupdate, archived_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 	maxAttempts := 5
 	now := time.Now().UTC().Unix()
@@ -599,11 +601,11 @@ func (c *CasIdx) addDefToArchive(def schema.MetricDefinition) error {
 	return err
 }
 
-func (c *CasIdx) Delete(orgId uint32, pattern string) ([]idx.Archive, error) {
+func (c *CasIdx) Delete(orgId uint32, pattern string) (int, error) {
 	pre := time.Now()
-	defs, err := c.MemoryIndex.Delete(orgId, pattern)
+	defs, err := c.MemoryIndex.DeletePersistent(orgId, pattern)
 	if err != nil {
-		return defs, err
+		return len(defs), err
 	}
 	if c.cfg.updateCassIdx {
 		for _, def := range defs {
@@ -614,7 +616,14 @@ func (c *CasIdx) Delete(orgId uint32, pattern string) ([]idx.Archive, error) {
 		}
 	}
 	statDeleteDuration.Value(time.Since(pre))
-	return defs, err
+
+	// there is nothing higher up in the call path that uses MetricDefinitions
+	// so this is the safest place to release the objects in MetricDefinition
+	// that have been interned
+	for _, arc := range defs {
+		idx.InternReleaseMetricDefinition(*arc.MetricDefinition)
+	}
+	return len(defs), err
 }
 
 func (c *CasIdx) deleteDef(key schema.MKey, part int32) error {
