@@ -313,7 +313,8 @@ func (c *CassandraStore) processWriteQueue(queue chan *mdata.ChunkWriteRequest, 
 			keyStr := cwr.Key.String()
 			log.Debugf("CS: starting to save %s:%d %v", keyStr, cwr.T0, cwr.Data)
 			//log how long the chunk waited in the queue before we attempted to save to cassandra
-			cassPutWaitDuration.Value(time.Now().Sub(cwr.Timestamp))
+			dequeueTime := time.Now()
+			cassPutWaitDuration.Value(dequeueTime.Sub(cwr.Timestamp))
 
 			chunkSizeAtSave.Value(len(cwr.Data))
 			success := false
@@ -328,16 +329,20 @@ func (c *CassandraStore) processWriteQueue(queue chan *mdata.ChunkWriteRequest, 
 					}
 					log.Debugf("CS: save complete. %s:%d %v", keyStr, cwr.T0, cwr.Data)
 					chunkSaveOk.Inc()
+				} else if err == errTableNotFound {
+					log.Errorf("CS: No table available for TTL = %d, dropping chunk = ", cwr.Data)
+					break
 				} else {
 					errmetrics.Inc(err)
-					if (attempts % 20) == 0 {
-						log.Warnf("CS: failed to save chunk to cassandra after %d attempts. %v, %s", attempts+1, cwr.Data, err)
-					}
-					chunkSaveFail.Inc()
 					sleepTime := 100 * attempts
 					if sleepTime > 2000 {
 						sleepTime = 2000
 					}
+					if attempts < 5 || attempts%100 == 0 {
+						log.Warnf("CS: failed to save chunk to cassandra after %d attempts, err = %s, timeSinceDequeue = %v, amkey = %v, T0 = %d. Sleeping %d ms.",
+							attempts+1, err, time.Now().Sub(dequeueTime), cwr.Key, cwr.T0, sleepTime)
+					}
+					chunkSaveFail.Inc()
 					time.Sleep(time.Duration(sleepTime) * time.Millisecond)
 					attempts++
 				}
