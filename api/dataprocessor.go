@@ -83,7 +83,7 @@ func Fix(in []schema.Point, from, to, interval uint32) []schema.Point {
 
 	// i iterates in. o iterates out. t is the ts we're looking to fill.
 	for t, i, o := first, 0, -1; t <= last; t += interval {
-		o += 1
+		o++
 
 		// input is out of values. add a null
 		if i >= len(in) {
@@ -116,7 +116,7 @@ func Fix(in []schema.Point, from, to, interval uint32) []schema.Point {
 				i++
 			}
 			t -= interval
-			o -= 1
+			o--
 		}
 	}
 	pointSlicePool.Put(in[:0])
@@ -635,7 +635,14 @@ func mergeSeries(in []models.Series) []models.Series {
 		if len(series) == 1 {
 			merged[i] = series[0]
 		} else {
-			//we use the first series in the list as our result.  We check over every
+			// TODO
+			// Remove this when https://github.com/grafana/metrictank/issues/913 is fixed
+			for i := range series {
+				series[i].Datapoints = Fix(series[i].Datapoints, series[i].QueryFrom, series[i].QueryTo, series[i].Interval)
+			}
+			// End TODO
+
+			// we use the first series in the list as our result.  We check over every
 			// point and if it is null, we then check the other series for a non null
 			// value to use instead.
 			log.Debugf("DP mergeSeries: %s has multiple series.", series[0].Target)
