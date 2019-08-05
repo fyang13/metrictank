@@ -318,7 +318,8 @@ func (s *Server) indexGet(ctx *middleware.Context, req models.IndexGet) {
 		return
 	}
 
-	response.Write(ctx, response.NewMsgp(200, &def))
+	response.Write(ctx, response.NewMsgp(200, def))
+	def.ReleaseInterned()
 }
 
 // IndexList returns msgp encoded schema.MetricDefinition's

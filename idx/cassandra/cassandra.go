@@ -64,6 +64,7 @@ type CasIdx struct {
 	cluster          *gocql.ClusterConfig
 	Session          *gocql.Session
 	writeQueue       chan writeReq
+	shutdown         chan struct{}
 	wg               sync.WaitGroup
 	updateInterval32 uint32
 }
@@ -102,6 +103,7 @@ func New(cfg *IdxConfig) *CasIdx {
 		Config:           cfg,
 		cluster:          cluster,
 		updateInterval32: uint32(cfg.updateInterval.Nanoseconds() / int64(time.Second)),
+		shutdown:         make(chan struct{}),
 	}
 	if cfg.updateCassIdx {
 		idx.writeQueue = make(chan writeReq, cfg.writeQueueSize)
@@ -230,6 +232,7 @@ func (c *CasIdx) Init() error {
 	c.rebuildIndex()
 
 	if memory.IndexRules.Prunable() {
+		c.wg.Add(1)
 		go c.prune()
 	}
 	return nil
@@ -238,6 +241,7 @@ func (c *CasIdx) Init() error {
 func (c *CasIdx) Stop() {
 	log.Info("cassandra-idx: stopping")
 	c.MemoryIndex.Stop()
+	close(c.shutdown)
 
 	// if updateCassIdx is disabled then writeQueue should never have been initialized
 	if c.Config.updateCassIdx {
@@ -249,14 +253,14 @@ func (c *CasIdx) Stop() {
 
 // Update updates an existing archive, if found.
 // It returns whether it was found, and - if so - the (updated) existing archive and its old partition
-func (c *CasIdx) Update(point schema.MetricPoint, partition int32) (*interning.ArchiveInterned, int32, bool) {
+func (c *CasIdx) Update(point schema.MetricPoint, partition int32) (schema.MKey, uint32, int32, bool) {
 	pre := time.Now()
 
-	archive, oldPartition, inMemory := c.MemoryIndex.Update(point, partition)
+	id, lastSave, oldPartition, inMemory := c.MemoryIndex.Update(point, partition)
 
 	if !c.Config.updateCassIdx {
 		statUpdateDuration.Value(time.Since(pre))
-		return archive, oldPartition, inMemory
+		return id, lastSave, oldPartition, inMemory
 	}
 
 	if inMemory {
@@ -269,28 +273,28 @@ func (c *CasIdx) Update(point schema.MetricPoint, partition int32) (*interning.A
 
 		// check if we need to save to cassandra.
 		now := uint32(time.Now().Unix())
-		if archive.LastSave < (now - c.updateInterval32) {
-			archive = c.updateCassandra(now, inMemory, archive, partition)
+		if lastSave < (now - c.updateInterval32) {
+			c.updateCassandra(now, inMemory, id, partition, lastSave)
 		}
 	}
 
 	statUpdateDuration.Value(time.Since(pre))
-	return archive, oldPartition, inMemory
+	return id, lastSave, oldPartition, inMemory
 }
 
-func (c *CasIdx) AddOrUpdate(mkey schema.MKey, data *schema.MetricData, partition int32) (*interning.ArchiveInterned, int32, bool) {
+func (c *CasIdx) AddOrUpdate(mkey schema.MKey, data *schema.MetricData, partition int32) (schema.MKey, uint32, int32, bool) {
 	pre := time.Now()
 
-	archive, oldPartition, inMemory := c.MemoryIndex.AddOrUpdate(mkey, data, partition)
+	id, lastSave, oldPartition, inMemory := c.MemoryIndex.AddOrUpdate(mkey, data, partition)
 
 	stat := statUpdateDuration
 	if !inMemory {
 		stat = statAddDuration
 	}
 
-	if !c.Config.updateCassIdx || archive == nil {
+	if !c.Config.updateCassIdx {
 		stat.Value(time.Since(pre))
-		return archive, oldPartition, inMemory
+		return id, lastSave, oldPartition, inMemory
 	}
 
 	if inMemory {
@@ -304,26 +308,29 @@ func (c *CasIdx) AddOrUpdate(mkey schema.MKey, data *schema.MetricData, partitio
 
 	// check if we need to save to cassandra.
 	now := uint32(time.Now().Unix())
-	if archive.LastSave < (now - c.updateInterval32) {
-		archive = c.updateCassandra(now, inMemory, archive, partition)
+	if lastSave < (now - c.updateInterval32) {
+		c.updateCassandra(now, inMemory, id, partition, lastSave)
 	}
 
 	stat.Value(time.Since(pre))
-	return archive, oldPartition, inMemory
+	return id, lastSave, oldPartition, inMemory
 }
 
 // updateCassandra saves the archive to cassandra and
 // updates the memory index with the updated fields.
-func (c *CasIdx) updateCassandra(now uint32, inMemory bool, archive *interning.ArchiveInterned, partition int32) *interning.ArchiveInterned {
+func (c *CasIdx) updateCassandra(now uint32, inMemory bool, id schema.MKey, partition int32, lastSave uint32) {
 	// if the entry has not been saved for 1.5x updateInterval
 	// then perform a blocking save.
-	if archive.LastSave < (now - c.updateInterval32 - c.updateInterval32/2) {
+	if lastSave < (now - c.updateInterval32 - c.updateInterval32/2) {
 		if log.IsLevelEnabled(log.DebugLevel) {
-			log.Debugf("cassandra-idx: updating def %s in index.", archive.MetricDefinitionInterned.Id)
+			log.Debugf("cassandra-idx: updating def %s in index.", id)
 		}
-		c.writeQueue <- writeReq{recvTime: time.Now(), def: archive.CloneInterned()}
-		archive.LastSave = now
-		c.MemoryIndex.UpdateArchiveLastSave(archive.MetricDefinitionInterned.Id, archive.Partition, now)
+		arc, ok := c.MemoryIndex.Get(id)
+		if ok {
+			c.writeQueue <- writeReq{recvTime: time.Now(), def: arc}
+			atomic.StoreUint32(&arc.LastSave, now)
+			c.MemoryIndex.UpdateArchiveLastSave(id, partition, now)
+		}
 	} else {
 		// perform a non-blocking write to the writeQueue. If the queue is full, then
 		// this will fail and we won't update the LastSave timestamp. The next time
@@ -331,17 +338,21 @@ func (c *CasIdx) updateCassandra(now uint32, inMemory bool, archive *interning.A
 		// we will try and save again.  This will continue until we are successful or the
 		// lastSave timestamp become more then 1.5 x UpdateInterval, in which case we will
 		// do a blocking write to the queue.
-		select {
-		case c.writeQueue <- writeReq{recvTime: time.Now(), def: archive.CloneInterned()}:
-			archive.LastSave = now
-			c.MemoryIndex.UpdateArchiveLastSave(archive.MetricDefinitionInterned.Id, archive.Partition, now)
-		default:
-			statSaveSkipped.Inc()
-			log.Debugf("cassandra-idx: writeQueue is full, update of %s not saved this time.", archive.MetricDefinitionInterned.Id)
+		arc, ok := c.MemoryIndex.Get(id)
+		if ok {
+			select {
+			case c.writeQueue <- writeReq{recvTime: time.Now(), def: arc}:
+				atomic.StoreUint32(&arc.LastSave, now)
+				c.MemoryIndex.UpdateArchiveLastSave(id, partition, now)
+			default:
+				// if the attempt to write to the queue failed we now need to decrement the
+				// reference count of the archive
+				arc.ReleaseInterned()
+				statSaveSkipped.Inc()
+				log.Debugf("cassandra-idx: writeQueue is full, update of %s not saved this time.", id)
+			}
 		}
 	}
-
-	return archive
 }
 
 func (c *CasIdx) rebuildIndex() {
@@ -514,14 +525,9 @@ func (c *CasIdx) ArchiveDefs(defs []interning.MetricDefinitionInterned) (int, er
 func (c *CasIdx) processWriteQueue() {
 	var success bool
 	var attempts int
-	var err error
 	var req writeReq
 	qry := fmt.Sprintf("INSERT INTO %s (id, orgid, partition, name, interval, unit, mtype, tags, lastupdate) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", c.Config.Table)
 	for req = range c.writeQueue {
-		if err != nil {
-			log.Errorf("Failed to marshal metricDef: %s. value was: %+v", err, *req.def)
-			continue
-		}
 		statQueryInsertWaitDuration.Value(time.Since(req.recvTime))
 		pre := time.Now()
 		success = false
@@ -575,9 +581,6 @@ func (c *CasIdx) addDefToArchive(def interning.MetricDefinitionInterned) error {
 	for attempts := 0; attempts < maxAttempts; attempts++ {
 		if attempts > 0 {
 			sleepTime := 100 * attempts
-			if sleepTime > 2000 {
-				sleepTime = 2000
-			}
 			time.Sleep(time.Duration(sleepTime) * time.Millisecond)
 		}
 
@@ -586,12 +589,12 @@ func (c *CasIdx) addDefToArchive(def interning.MetricDefinitionInterned) error {
 			def.Id.String(),
 			def.OrgId,
 			def.Partition,
-			def.Name,
+			def.Name.String(),
 			def.Interval,
 			def.Unit.String(),
-			def.Mtype,
-			def.Tags,
-			def.LastUpdate,
+			def.Mtype(),
+			def.Tags.Strings(),
+			atomic.LoadInt64(&def.LastUpdate),
 			now).Exec()
 
 		if err == nil {
@@ -674,11 +677,17 @@ func (c *CasIdx) Prune(now time.Time) ([]*interning.ArchiveInterned, error) {
 }
 
 func (c *CasIdx) prune() {
+	defer c.wg.Done()
 	ticker := time.NewTicker(c.Config.pruneInterval)
-	for now := range ticker.C {
-		defs, _ := c.Prune(now)
-		for i := range defs {
-			defs[i].ReleaseInterned()
+	for {
+		select {
+		case now := <-ticker.C:
+			defs, _ := c.Prune(now)
+			for i := range defs {
+				defs[i].ReleaseInterned()
+			}
+		case <-c.shutdown:
+			return
 		}
 	}
 }

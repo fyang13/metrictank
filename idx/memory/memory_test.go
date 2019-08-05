@@ -586,7 +586,10 @@ func testMixedBranchLeaf(t *testing.T) {
 			}
 
 			ix.AddOrUpdate(mkey, second, getPartition(second))
-			_, ok := ix.Get(mkey)
+			arc, ok := ix.Get(mkey)
+			if ok {
+				arc.ReleaseInterned()
+			}
 			So(ok, ShouldEqual, true)
 			defs := ix.List(1)
 			So(len(defs), ShouldEqual, 2)
@@ -598,7 +601,10 @@ func testMixedBranchLeaf(t *testing.T) {
 			}
 
 			ix.AddOrUpdate(mkey, third, getPartition(third))
-			_, ok := ix.Get(mkey)
+			arc, ok := ix.Get(mkey)
+			if ok {
+				arc.ReleaseInterned()
+			}
 			So(ok, ShouldEqual, true)
 			defs := ix.List(1)
 			So(len(defs), ShouldEqual, 3)
@@ -660,11 +666,15 @@ func testMixedBranchLeafDelete(t *testing.T) {
 		deletedIds := make([]schema.MKey, len(defs))
 		for i, d := range defs {
 			deletedIds[i] = d.Id
+			d.ReleaseInterned()
 		}
 		So(test.MustMKeyFromString(series[0].Id), test.ShouldContainMKey, deletedIds)
 		So(test.MustMKeyFromString(series[1].Id), test.ShouldContainMKey, deletedIds)
 		Convey("series should not be present in the metricDef index", func() {
-			_, ok := ix.Get(mkeys[0])
+			arc, ok := ix.Get(mkeys[0])
+			if ok {
+				arc.ReleaseInterned()
+			}
 			So(ok, ShouldEqual, false)
 			Convey("series should not be present in searches", func() {
 				found, err := ix.Find(1, "a.b.c", 0)
@@ -683,9 +693,15 @@ func testMixedBranchLeafDelete(t *testing.T) {
 		if defs[0].Id != mkeys[3] {
 			t.Fatalf("%v must equal %v", defs[0].Id, mkeys[3])
 		}
+		for _, a := range defs {
+			a.ReleaseInterned()
+		}
 
 		Convey("deleted series should not be present in the metricDef index", func() {
-			_, ok := ix.Get(mkeys[3])
+			arc, ok := ix.Get(mkeys[3])
+			if ok {
+				arc.ReleaseInterned()
+			}
 			So(ok, ShouldEqual, false)
 			Convey("deleted series should not be present in searches", func() {
 				found, err := ix.Find(1, "a.b.c2.*", 0)
@@ -1043,10 +1059,15 @@ func testMetricNameStartingWithTilde(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	arch, _, _ := ix.AddOrUpdate(mkey, data, getPartition(data))
-	if arch.Name.String() != metricName {
-		t.Fatalf("Expected metric name to be %q, but it was %q", metricName, arch.Name)
+	id, _, _, _ := ix.AddOrUpdate(mkey, data, getPartition(data))
+	arc, ok := ix.Get(id)
+	if !ok {
+		t.Fatalf("Failed to retrieve ArchiveInterned with MKey %v", id)
 	}
+	if arc.Name.String() != metricName {
+		t.Fatalf("Expected metric name to be %q, but it was %q", metricName, arc.Name.String())
+	}
+	arc.ReleaseInterned()
 
 	// query by the name minus the leading ~ characters
 	query, err := tagquery.NewQueryFromStrings([]string{"name=" + expectedNameTag}, 0)
@@ -1129,15 +1150,19 @@ func testThatInternedObjectsGetCleanedUp(t *testing.T) {
 			t.Fatalf("Failed to get AMKey from ID (%s): %s", mds[i].Id, err)
 		}
 
-		arch, _, _ := ix.AddOrUpdate(mkeys[i], &mds[i], 1)
-		archivesInterned = append(archivesInterned, arch)
+		id, _, _, _ := ix.AddOrUpdate(mkeys[i], &mds[i], 1)
+		arc, ok := ix.Get(id)
+		if !ok {
+			t.Fatalf("Failed to get ArchiveInterned from MKey %v", id)
+		}
+		archivesInterned = append(archivesInterned, arc)
 	}
 
 	// add a bunch of metric points into the index via Update
 	// keep the returned interned archive references, but don't release them yet
 	for i := range mds {
 		for j := 100; j < 200; j++ {
-			arch, _, exists := ix.Update(schema.MetricPoint{
+			id, _, _, exists := ix.Update(schema.MetricPoint{
 				MKey:  mkeys[i],
 				Value: float64(j),
 				Time:  uint32(j),
@@ -1145,7 +1170,11 @@ func testThatInternedObjectsGetCleanedUp(t *testing.T) {
 			if !exists {
 				t.Fatalf("Metric was expected to be present in index, but it was not: %s", mkeys[i].String())
 			}
-			archivesInterned = append(archivesInterned, arch)
+			arc, ok := ix.Get(id)
+			if !ok {
+				t.Fatalf("Failed to get ArchiveInterned from MKey %v", id)
+			}
+			archivesInterned = append(archivesInterned, arc)
 		}
 	}
 
