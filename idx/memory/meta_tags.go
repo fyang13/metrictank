@@ -5,8 +5,6 @@ import (
 	"sync/atomic"
 	"unsafe"
 
-	"github.com/grafana/metrictank/util"
-
 	"github.com/grafana/metrictank/errors"
 	"github.com/grafana/metrictank/expr/tagquery"
 	"github.com/grafana/metrictank/schema"
@@ -162,15 +160,7 @@ type enricher struct {
 }
 
 func (e *enricher) enrich(id schema.MKey, name string, tags []string) tagquery.Tags {
-	h := util.NewFnv64aStringWriter()
-	h.WriteString(name)
-	for i := range tags {
-		h.WriteString(";")
-		h.WriteString(tags[i])
-	}
-	sum := h.Sum64()
-
-	cachedRes, ok := e.cache.Get(sum)
+	cachedRes, ok := e.cache.Get(id)
 	if ok {
 		return cachedRes.(tagquery.Tags)
 	}
@@ -184,7 +174,7 @@ func (e *enricher) enrich(id schema.MKey, name string, tags []string) tagquery.T
 		}
 	}
 
-	e.cache.Add(sum, res)
+	e.cache.Add(id, res)
 
 	return res
 }
