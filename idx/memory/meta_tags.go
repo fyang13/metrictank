@@ -159,8 +159,13 @@ type enricher struct {
 	cache   *lru.Cache
 }
 
+// enrich takes a metric id, the name string and its tags as strings and evaluates the
+// expressions of all meta records to determine which meta tags need to be associated
+// with that given metric.
+// it is heavily cached, the cache key is org agnostic because the enricher needs to
+// be instantiated once per org.
 func (e *enricher) enrich(id schema.MKey, name string, tags []string) tagquery.Tags {
-	cachedRes, ok := e.cache.Get(id)
+	cachedRes, ok := e.cache.Get(id.Key)
 	if ok {
 		return cachedRes.(tagquery.Tags)
 	}
@@ -174,7 +179,7 @@ func (e *enricher) enrich(id schema.MKey, name string, tags []string) tagquery.T
 		}
 	}
 
-	e.cache.Add(id, res)
+	e.cache.Add(id.Key, res)
 
 	return res
 }
