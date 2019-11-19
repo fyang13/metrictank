@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/gocql/gocql"
+	"github.com/scylladb/gocql"
 	"github.com/grafana/metrictank/stats"
 )
 

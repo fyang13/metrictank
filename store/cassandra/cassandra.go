@@ -11,7 +11,7 @@ import (
 
 	"github.com/raintank/schema"
 
-	"github.com/gocql/gocql"
+	"github.com/scylladb/gocql"
 	"github.com/grafana/metrictank/cassandra"
 	"github.com/grafana/metrictank/mdata"
 	"github.com/grafana/metrictank/mdata/chunk"
