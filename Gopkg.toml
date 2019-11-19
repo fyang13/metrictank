@@ -63,7 +63,7 @@ unused-packages = true
 
 [[constraint]]
   name = "github.com/scylladb/gocql"
-  revision = "v1.3.1"
+  version = "v1.3.1"
 
 [[constraint]]
   name = "github.com/golang/snappy"
